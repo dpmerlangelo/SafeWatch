@@ -1,0 +1,2649 @@
+import 'dart:async';
+import 'dart:convert' show LineSplitter, Utf8Decoder;
+import 'dart:io' show Directory, File, Platform, Process, ProcessException;
+
+import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:window_manager/window_manager.dart';
+
+import '../services/alert_notifications.dart';
+import '../constants/app_colors.dart';
+
+// NOTE on local recording (see `_newRecordingFilePath` / `_resolveBundled
+// Ffmpeg` / `_CameraFeed.startRecording`):
+//
+//  - `path_provider` is used to find writable folders on the machine
+//    running the app. Add to pubspec.yaml if missing:
+//      path_provider: ^2.1.0
+//
+//  - Recording is done by spawning `ffmpeg` as a subprocess to stream-copy
+//    the RTSP feed into a file, independent of playback. To avoid needing
+//    ffmpeg installed system-wide on every device, a copy is bundled with
+//    the app as a Flutter asset and extracted to local storage on first
+//    use. One-time setup per platform you ship:
+//
+//      1. Download a static ffmpeg build (no separate install, just the
+//         executable) for each OS you target:
+//           Windows: https://www.gyan.dev/ffmpeg/builds/ ("release full"
+//                     or "release essentials" zip — grab bin/ffmpeg.exe)
+//           macOS:   https://evermeet.cx/ffmpeg/
+//           Linux:   https://johnvansickle.com/ffmpeg/
+//
+//      2. Put the binary in your project at:
+//           assets/ffmpeg/ffmpeg.exe   (Windows)
+//           assets/ffmpeg/ffmpeg       (macOS/Linux — same filename, only
+//                                        include the one(s) for the OS(es)
+//                                        you're shipping)
+//
+//      3. Register the folder in pubspec.yaml:
+//           flutter:
+//             assets:
+//               - assets/ffmpeg/
+//
+//      4. `flutter pub get` and rebuild. On first recording attempt the
+//         app copies the bundled binary out to local app-support storage
+//         and reuses it after that — no PATH setup needed on the target
+//         machine.
+//
+//    ffmpeg is LGPL/GPL-licensed depending on the build — check
+//    https://ffmpeg.org/legal.html for what redistributing a copy with
+//    your app requires (typically: keep the binary as-is/unmodified and
+//    make the corresponding source available on request for GPL builds,
+//    or use an LGPL build if you'd rather avoid that).
+//
+//    If no asset is bundled, recording silently falls back to whatever
+//    `ffmpeg` resolves to on the system PATH (the previous behavior).
+
+/// True on Windows/macOS/Linux desktop builds (not web, not mobile).
+
+bool get _isDesktopPlatform =>
+    !kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
+
+/// Guards against media_kit's native backend never having been set up.
+bool _mediaKitReady = false;
+void _ensureMediaKitReady() {
+  if (_mediaKitReady) return;
+  MediaKit.ensureInitialized();
+  _mediaKitReady = true;
+}
+
+/// Resolves a working ffmpeg executable for local recording.
+///
+/// Looks for a copy bundled as a Flutter asset (`assets/ffmpeg/ffmpeg.exe`
+/// on Windows, `assets/ffmpeg/ffmpeg` on macOS/Linux) and — the first time
+/// it's needed — copies it out to a writable folder on disk, since asset
+/// bundle contents can't be executed in place. After that first copy it
+/// just reuses the extracted file, so this is cheap on subsequent calls.
+///
+/// Returns null if no bundled binary was found, in which case the caller
+/// should fall back to whatever `ffmpeg` resolves to on PATH.
+Future<String?> _resolveBundledFfmpeg() async {
+  final binaryName = Platform.isWindows ? 'ffmpeg.exe' : 'ffmpeg';
+  final assetPath = 'assets/ffmpeg/$binaryName';
+
+  try {
+    final supportDir = await getApplicationSupportDirectory();
+    final binDir = Directory('${supportDir.path}${Platform.pathSeparator}bin');
+    if (!await binDir.exists()) {
+      await binDir.create(recursive: true);
+    }
+    final localFile = File('${binDir.path}${Platform.pathSeparator}$binaryName');
+
+    if (!await localFile.exists()) {
+      final data = await rootBundle.load(assetPath);
+      await localFile.writeAsBytes(
+        data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+        flush: true,
+      );
+      if (!Platform.isWindows) {
+        // Extracted files aren't executable by default on macOS/Linux.
+        await Process.run('chmod', ['+x', localFile.path]);
+      }
+    }
+    return localFile.path;
+  } catch (e) {
+    // No bundled binary present (asset missing) — caller falls back to
+    // whatever "ffmpeg" resolves to on the system PATH, if anything.
+    debugPrint('No bundled ffmpeg asset found ($e); will try PATH instead.');
+    return null;
+  }
+}
+
+/// Builds a fresh, unique file path under a "CCTV Recordings" folder on the
+/// local machine (laptop/PC/server running the app) for a new recording of
+/// [camera]. Falls back to the current working directory if the platform's
+/// documents folder can't be resolved.
+Future<String> _newRecordingFilePath(CctvCamera camera) async {
+  Directory baseDir;
+  try {
+    final docs = await getApplicationDocumentsDirectory();
+    baseDir = Directory('${docs.path}${Platform.pathSeparator}CCTV Recordings');
+  } catch (_) {
+    baseDir =
+        Directory('${Directory.current.path}${Platform.pathSeparator}CCTV Recordings');
+  }
+  if (!await baseDir.exists()) {
+    await baseDir.create(recursive: true);
+  }
+
+  final safeName = camera.name
+      .replaceAll(RegExp(r'[^A-Za-z0-9 _-]'), '')
+      .trim()
+      .replaceAll(' ', '_');
+  final now = DateTime.now();
+  String two(int n) => n.toString().padLeft(2, '0');
+  final stamp =
+      '${now.year}${two(now.month)}${two(now.day)}_${two(now.hour)}${two(now.minute)}${two(now.second)}';
+
+  return '${baseDir.path}${Platform.pathSeparator}'
+      '${safeName.isEmpty ? 'Camera' : safeName}_$stamp.mkv';
+}
+
+PageRoute<T> _instantRoute<T>(WidgetBuilder builder) {
+  return PageRouteBuilder<T>(
+    pageBuilder: (context, animation, secondaryAnimation) => builder(context),
+    transitionDuration: Duration.zero,
+    reverseTransitionDuration: Duration.zero,
+    opaque: true,
+  );
+}
+
+/// A single camera's connection info needed to build its RTSP URL.
+class CctvCamera {
+  final String id;
+  final String name;
+  final String ip;
+  final int rtspPort;
+  final String? username;
+  final String? password;
+  final String? location;
+  final String? serialNumber;
+  final String? status;
+  final String? streamUrlOverride;
+  final String channelPath;
+  final double? latitude;
+  final double? longitude;
+
+  const CctvCamera({
+    required this.id,
+    required this.name,
+    required this.ip,
+    this.rtspPort = 554,
+    this.username,
+    this.password,
+    this.location,
+    this.serialNumber,
+    this.status,
+    this.streamUrlOverride,
+    this.channelPath = 'Streaming/Channels/101',
+    this.latitude,
+    this.longitude,
+  });
+
+  factory CctvCamera.fromMap(Map<String, dynamic> data) {
+    final portStr = (data['port'] ?? '554').toString().trim();
+    final port = int.tryParse(portStr) ?? 554;
+    return CctvCamera(
+      id: data['id'].toString(),
+      name: (data['name'] ?? 'Unnamed Camera').toString(),
+      ip: (data['ip_address'] ?? '').toString().trim(),
+      rtspPort: port,
+      username: (data['username'] as String?)?.trim(),
+      password: (data['password'] as String?)?.trim(),
+      location: (data['location'] as String?)?.trim(),
+      serialNumber: (data['serial_number'] as String?)?.trim(),
+      status: (data['status'] as String?)?.trim(),
+      streamUrlOverride: (data['stream_url'] as String?)?.trim(),
+      latitude: (data['latitude'] as num?)?.toDouble(),
+      longitude: (data['longitude'] as num?)?.toDouble(),
+    );
+  }
+
+  static List<CctvCamera> listFromMaps(List<Map<String, dynamic>> list) {
+    return list
+        .map((data) => CctvCamera.fromMap(data))
+        .where((camera) => camera.ip.isNotEmpty)
+        .toList();
+  }
+
+  String get rtspUrl {
+    if (streamUrlOverride != null && streamUrlOverride!.isNotEmpty) {
+      return streamUrlOverride!;
+    }
+    final auth = (username != null &&
+            username!.isNotEmpty &&
+            password != null &&
+            password!.isNotEmpty)
+        ? '$username:$password@'
+        : '';
+    return 'rtsp://$auth$ip:$rtspPort/$channelPath';
+  }
+}
+
+enum AlertLevel {
+  advisory,
+  priority,
+  critical;
+
+  static AlertLevel? fromString(String? raw) {
+    switch (raw) {
+      case 'advisory':
+        return AlertLevel.advisory;
+      case 'priority':
+        return AlertLevel.priority;
+      case 'critical':
+        return AlertLevel.critical;
+      default:
+        return null;
+    }
+  }
+
+  /// Fallback when a row has no explicit level set yet.
+  ///
+  /// 'Violence' and 'Accident' (capitalized) are the class names that come
+  /// straight out of the SafeWatch .pt model — see SAFEWATCH_CLASSES in
+  /// yolo_detection_service.py. 'fire' also comes from SafeWatch. 'curfew'
+  /// and 'traffic' are the two heuristic alert types the plain YOLO
+  /// detection service is still responsible for.
+  static AlertLevel forAlertType(String alertType) {
+    switch (alertType) {
+      case 'fire':
+      case 'Violence':
+        return AlertLevel.critical;
+      case 'Accident':
+      case 'traffic':
+        return AlertLevel.priority;
+      case 'curfew':
+        return AlertLevel.advisory;
+      default:
+        return AlertLevel.priority;
+    }
+  }
+
+  Color get color => switch (this) {
+        AlertLevel.advisory => const Color(0xFFFFC107), // yellow
+        AlertLevel.priority => const Color(0xFFFF9800), // orange
+        AlertLevel.critical => const Color(0xFFFF3B30), // red
+      };
+
+  String get label => switch (this) {
+        AlertLevel.advisory => 'LEVEL 1 · ADVISORY',
+        AlertLevel.priority => 'LEVEL 2 · PRIORITY',
+        AlertLevel.critical => 'LEVEL 3 · CRITICAL',
+      };
+}
+
+// ---------------------------------------------------------------------------
+// Layout scheme model
+// ---------------------------------------------------------------------------
+
+class CameraLayoutScheme {
+  final String id;
+  String name;
+  final int columns;
+  final int rows;
+  final bool isPreset;
+
+  /// length == columns * rows. Each entry is a camera id, or null if empty.
+  List<String?> slotCameraIds;
+
+  CameraLayoutScheme({
+    required this.id,
+    required this.name,
+    required this.columns,
+    required this.rows,
+    required this.slotCameraIds,
+    this.isPreset = false,
+  }) {
+    _resizeSlotsIfNeeded();
+  }
+
+  int get slotCount => columns * rows;
+
+  void _resizeSlotsIfNeeded() {
+    if (slotCameraIds.length == slotCount) return;
+    final resized = List<String?>.filled(slotCount, null);
+    for (var i = 0; i < slotCameraIds.length && i < slotCount; i++) {
+      resized[i] = slotCameraIds[i];
+    }
+    slotCameraIds = resized;
+  }
+
+  factory CameraLayoutScheme.autoFill({
+    required int columns,
+    required int rows,
+    required List<CctvCamera> cameras,
+    required String label,
+  }) {
+    final slotCount = columns * rows;
+    final slots = List<String?>.filled(slotCount, null);
+    for (var i = 0; i < cameras.length && i < slotCount; i++) {
+      slots[i] = cameras[i].id;
+    }
+    return CameraLayoutScheme(
+      id: 'preset_${columns}x$rows',
+      name: label,
+      columns: columns,
+      rows: rows,
+      slotCameraIds: slots,
+      isPreset: true,
+    );
+  }
+
+  CameraLayoutScheme copyWith({
+    String? id,
+    String? name,
+    int? columns,
+    int? rows,
+    List<String?>? slotCameraIds,
+    bool? isPreset,
+  }) {
+    return CameraLayoutScheme(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      columns: columns ?? this.columns,
+      rows: rows ?? this.rows,
+      slotCameraIds: slotCameraIds ?? List<String?>.from(this.slotCameraIds),
+      isPreset: isPreset ?? this.isPreset,
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'name': name,
+      'columns': columns,
+      'rows': rows,
+      'slotCameraIds': slotCameraIds,
+    };
+  }
+
+  factory CameraLayoutScheme.fromMap(Map<String, dynamic> map) {
+    final rawSlots = (map['slotCameraIds'] as List?) ?? const [];
+    return CameraLayoutScheme(
+      id: (map['id'] ?? DateTime.now().millisecondsSinceEpoch.toString())
+          .toString(),
+      name: (map['name'] ?? 'Layout').toString(),
+      columns: (map['columns'] as num?)?.toInt() ?? 2,
+      rows: (map['rows'] as num?)?.toInt() ?? 2,
+      slotCameraIds:
+          rawSlots.map((e) => e == null ? null : e.toString()).toList(),
+      isPreset: false,
+    );
+  }
+
+  /// Builds a scheme from a `camera_layouts` table row.
+  factory CameraLayoutScheme.fromSupabaseRow(Map<String, dynamic> row) {
+    final rawSlots = (row['slot_camera_ids'] as List?) ?? const [];
+    return CameraLayoutScheme(
+      id: row['id'].toString(),
+      name: (row['name'] ?? 'Layout').toString(),
+      columns: (row['columns'] as num?)?.toInt() ?? 2,
+      rows: (row['rows'] as num?)?.toInt() ?? 2,
+      slotCameraIds:
+          rawSlots.map((e) => e == null ? null : e.toString()).toList(),
+      isPreset: false,
+    );
+  }
+
+  /// Row payload for insert/upsert into `camera_layouts`.
+  /// Omits `id` for a fresh, not-yet-saved layout (client-generated
+  /// millisecond ids aren't valid uuids) so Postgres can generate one.
+  Map<String, dynamic> toSupabaseRow(String userId) {
+    final looksLikeUuid = RegExp(
+            r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+        .hasMatch(id);
+    return {
+      if (looksLikeUuid) 'id': id,
+      'user_id': userId,
+      'name': name,
+      'columns': columns,
+      'rows': rows,
+      'slot_camera_ids': slotCameraIds,
+      'updated_at': DateTime.now().toIso8601String(),
+    };
+  }
+
+  static const List<_PresetSize> presetSizes = [
+    _PresetSize(2, 2, '2x2'),
+    _PresetSize(3, 3, '3x3'),
+    _PresetSize(4, 4, '4x4'),
+  ];
+}
+
+class _PresetSize {
+  final int columns;
+  final int rows;
+  final String label;
+  const _PresetSize(this.columns, this.rows, this.label);
+}
+
+// ---------------------------------------------------------------------------
+// Screen
+// ---------------------------------------------------------------------------
+
+class CctvLiveScreen extends StatefulWidget {
+  final bool isActive;
+  final List<CctvCamera> cameras;
+
+  const CctvLiveScreen({
+    super.key,
+    required this.isActive,
+    required this.cameras,
+  });
+
+  static Widget fromSupabase({required bool isActive}) {
+    return _CctvLiveScreenSupabaseBridge(isActive: isActive);
+  }
+
+  @override
+  State<CctvLiveScreen> createState() => _CctvLiveScreenState();
+}
+
+class _CctvLiveScreenSupabaseBridge extends StatelessWidget {
+  final bool isActive;
+  const _CctvLiveScreenSupabaseBridge({required this.isActive});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<List<Map<String, dynamic>>>(
+      stream: Supabase.instance.client
+          .from('cameras')
+          .stream(primaryKey: ['id'])
+          .order('created_at', ascending: false),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(
+            child: CircularProgressIndicator(color: Colors.white70),
+          );
+        }
+        if (snapshot.hasError) {
+          return Center(
+            child: Text(
+              'Error loading cameras: ${snapshot.error}',
+              style: const TextStyle(color: Colors.white70),
+            ),
+          );
+        }
+        final cameras = snapshot.hasData
+            ? CctvCamera.listFromMaps(snapshot.data!)
+            : const <CctvCamera>[];
+        return CctvLiveScreen(isActive: isActive, cameras: cameras);
+      },
+    );
+  }
+}
+
+class _CameraFeed {
+  final CctvCamera camera;
+  final Player player;
+  final VideoController controller;
+  bool hasError = false;
+  String? errorMessage;
+  bool isBuffering = true;
+
+  /// Cameras start muted (matches the IVMS4200 convention of a silent
+  /// grid) — tap a tile once to reveal the speaker toggle and unmute it.
+  bool isMuted = true;
+
+  /// Whether this feed is currently being saved to a local file.
+  bool isRecording = false;
+  String? recordingPath;
+  Process? _recordingProcess;
+
+  DateTime lastActivityAt = DateTime.now();
+  bool isAutoRecoverable = false;
+  DateTime? disconnectedAt;
+  DateTime? recoveryCandidateSince;
+
+  StreamSubscription<Duration>? _positionSub;
+  StreamSubscription<String>? _errorSub;
+  StreamSubscription<bool>? _bufferingSub;
+
+  _CameraFeed._(this.camera, this.player, this.controller);
+
+  factory _CameraFeed(CctvCamera camera) {
+    final player = Player(
+      configuration: const PlayerConfiguration(
+        bufferSize: 2 * 1024 * 1024,
+      ),
+    );
+
+    if (player.platform is libmpvPlayer) {
+      final mpv = player.platform as libmpvPlayer;
+
+      mpv.setProperty('profile', 'low-latency');
+      mpv.setProperty('cache', 'yes');
+      mpv.setProperty('demuxer-max-bytes', '512000');
+      mpv.setProperty('demuxer-readahead-secs', '0.2');
+      mpv.setProperty('video-sync', 'display-resample');
+      mpv.setProperty('rtsp-transport', 'tcp');
+      mpv.setProperty('framedrop', 'vo');
+      mpv.setProperty('hwdec', 'auto-safe');
+      mpv.setProperty('network-timeout', '8');
+    }
+
+    // Start silent so opening several tiles at once doesn't blast audio
+    // from every camera simultaneously.
+    player.setVolume(0);
+
+    final controller = VideoController(player);
+    return _CameraFeed._(camera, player, controller);
+  }
+
+  Future<void> toggleMute() async {
+    isMuted = !isMuted;
+    await player.setVolume(isMuted ? 0 : 100);
+  }
+
+  /// Starts saving the live stream to [filePath] on local disk.
+  ///
+  /// This spawns a separate `ffmpeg` process that pulls the RTSP feed
+  /// independently of playback and does a clean stream-copy (no
+  /// re-encoding, so it's cheap on CPU) into a proper container. This is
+  /// deliberately NOT done via mpv's `stream-record` property — that dumps
+  /// the raw, undemuxed byte stream, which for RTSP/RTP sources frequently
+  /// produces a file that "exists" but isn't actually playable.
+  ///
+  /// Uses a copy of ffmpeg bundled with the app if one was packaged in
+  /// (see `_resolveBundledFfmpeg`), so recording works on a fresh machine
+  /// without a separate install. Falls back to `ffmpeg` on PATH if no
+  /// bundled copy is found.
+  Future<bool> startRecording(String filePath) async {
+    try {
+      final ffmpegPath = await _resolveBundledFfmpeg() ?? 'ffmpeg';
+      final process = await Process.start(
+        ffmpegPath,
+        [
+          '-y',
+          '-rtsp_transport', 'tcp',
+          '-i', camera.rtspUrl,
+          '-c', 'copy',
+          filePath,
+        ],
+        runInShell: true,
+      );
+      _recordingProcess = process;
+      isRecording = true;
+      recordingPath = filePath;
+
+      // Surface ffmpeg's own diagnostics in the debug console — useful if
+      // the source codec can't be stream-copied into this container, the
+      // camera drops the connection, etc.
+      process.stderr
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .transform(const LineSplitter())
+          .listen((line) => debugPrint('[ffmpeg:${camera.name}] $line'));
+
+      unawaited(process.exitCode.then((code) {
+        if (code != 0) {
+          debugPrint(
+              'ffmpeg recording for ${camera.name} exited with code $code');
+        }
+        if (identical(_recordingProcess, process)) {
+          _recordingProcess = null;
+          isRecording = false;
+        }
+      }));
+
+      return true;
+    } on ProcessException catch (e) {
+      debugPrint(
+          'Failed to start recording for ${camera.name}: ffmpeg not found ($e)');
+      return false;
+    } catch (e) {
+      debugPrint('Failed to start recording for ${camera.name}: $e');
+      return false;
+    }
+  }
+
+  Future<void> stopRecording() async {
+    isRecording = false;
+    final process = _recordingProcess;
+    _recordingProcess = null;
+    if (process == null) return;
+    try {
+      // Ask ffmpeg to shut down cleanly (flushes the container's index/
+      // trailer) instead of killing it outright, which can leave a
+      // corrupt, unplayable file.
+      process.stdin.writeln('q');
+      await process.stdin.flush();
+      await process.exitCode.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          process.kill();
+          return -1;
+        },
+      );
+    } catch (e) {
+      debugPrint('Failed to stop recording for ${camera.name}: $e');
+      process.kill();
+    }
+  }
+
+  Future<void> dispose() async {
+    if (isRecording) {
+      try {
+        await stopRecording();
+      } catch (_) {}
+    }
+    await _positionSub?.cancel();
+    await _errorSub?.cancel();
+    await _bufferingSub?.cancel();
+    await player.dispose();
+  }
+}
+
+class _CctvLiveScreenState extends State<CctvLiveScreen> {
+  final Map<String, _CameraFeed> _feeds = {};
+  final List<CameraLayoutScheme> _customLayouts = [];
+  late CameraLayoutScheme _currentLayout;
+
+  String? _zoomedCameraId;
+  bool _sidePanelOpen = false;
+  bool _layoutManagerOpen = false;
+  bool _layoutsLoaded = false;
+
+  final ValueNotifier<int> _feedsVersion = ValueNotifier(0);
+  Timer? _watchdogTimer;
+
+  static const double _sidePanelWidth = 230;
+  static const Duration _stallThreshold = Duration(seconds: 10);
+  static const Duration _watchdogInterval = Duration(seconds: 3);
+  static const Duration _reconnectCooldown = Duration(seconds: 8);
+  static const Duration _recoverySustainDuration = Duration(milliseconds: 1200);
+
+  Map<String, CctvCamera> get _camerasById =>
+      {for (final c in widget.cameras) c.id: c};
+
+  @override
+  void initState() {
+    super.initState();
+    _currentLayout = CameraLayoutScheme.autoFill(
+      columns: 2,
+      rows: 2,
+      cameras: widget.cameras,
+      label: '2x2',
+    );
+    _loadLayoutsFromSupabase();
+    _syncFeedsToLayout();
+
+    _watchdogTimer = Timer.periodic(_watchdogInterval, (_) => _checkStalledFeeds());
+
+    // Keep the app-wide alert watcher (sound + notification bell) fed with
+    // up-to-date camera names, and make sure it's running. This is a
+    // singleton so it keeps listening even if this screen is later
+    // unmounted (e.g. user switches tabs) — alerts still make sound/appear
+    // in the top-bar notification tab.
+    AlertWatcher.instance
+      ..updateCameraNames({for (final c in widget.cameras) c.id: c.name})
+      ..start();
+  }
+
+  @override
+  void didUpdateWidget(covariant CctvLiveScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    if (!_sameCameraList(oldWidget.cameras, widget.cameras)) {
+      _syncFeedsToLayout();
+      AlertWatcher.instance
+          .updateCameraNames({for (final c in widget.cameras) c.id: c.name});
+    }
+  }
+
+  bool _sameCameraList(List<CctvCamera> a, List<CctvCamera> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i].id != b[i].id || a[i].rtspUrl != b[i].rtspUrl) return false;
+    }
+    return true;
+  }
+
+  void _checkStalledFeeds() {
+    if (!mounted) return;
+    final now = DateTime.now();
+    for (final feed in _feeds.values.toList()) {
+      if (feed.hasError) {
+        if (feed.isAutoRecoverable &&
+            feed.disconnectedAt != null &&
+            now.difference(feed.disconnectedAt!) > _reconnectCooldown) {
+          _retryFeed(feed.camera);
+        }
+        continue;
+      }
+      final stalled = now.difference(feed.lastActivityAt) > _stallThreshold;
+      if (stalled) {
+        setState(() {
+          feed.hasError = true;
+          feed.isAutoRecoverable = true;
+          feed.disconnectedAt = now;
+          feed.isBuffering = false;
+          feed.errorMessage = 'Camera disconnected';
+          feed.recoveryCandidateSince = null;
+        });
+        _feedsVersion.value++;
+      }
+    }
+  }
+
+  // --- LAYOUT PERSISTENCE (dedicated `camera_layouts` table) ---
+
+  Future<void> _loadLayoutsFromSupabase() async {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) {
+      _layoutsLoaded = true;
+      return;
+    }
+    try {
+      final response = await Supabase.instance.client
+          .from('camera_layouts')
+          .select()
+          .eq('user_id', uid)
+          .order('created_at', ascending: true);
+
+      final loaded = (response as List)
+          .map((row) => CameraLayoutScheme.fromSupabaseRow(
+              Map<String, dynamic>.from(row)))
+          .toList();
+
+      if (!mounted) return;
+      setState(() {
+        _customLayouts
+          ..clear()
+          ..addAll(loaded);
+      });
+    } catch (e) {
+      debugPrint('Failed to load camera layouts: $e');
+    } finally {
+      _layoutsLoaded = true;
+    }
+  }
+
+  /// Inserts a new layout or updates an existing one, returning the
+  /// server-resolved row (with a real uuid if this was a new layout).
+  Future<CameraLayoutScheme?> _upsertLayoutRemote(
+      CameraLayoutScheme layout) async {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) return null;
+    try {
+      final row = layout.toSupabaseRow(uid);
+      final response = await Supabase.instance.client
+          .from('camera_layouts')
+          .upsert(row)
+          .select()
+          .single();
+      return CameraLayoutScheme.fromSupabaseRow(
+          Map<String, dynamic>.from(response));
+    } catch (e) {
+      debugPrint('Failed to save camera layout: $e');
+      return null;
+    }
+  }
+
+  Future<void> _deleteLayoutRemote(CameraLayoutScheme layout) async {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) return;
+    try {
+      await Supabase.instance.client
+          .from('camera_layouts')
+          .delete()
+          .eq('id', layout.id)
+          .eq('user_id', uid);
+    } catch (e) {
+      debugPrint('Failed to delete camera layout: $e');
+    }
+  }
+
+  void _syncFeedsToLayout() {
+    final neededIds = _currentLayout.slotCameraIds
+        .whereType<String>()
+        .toSet();
+
+    for (final id in _feeds.keys.toList()) {
+      if (!neededIds.contains(id)) {
+        _feeds.remove(id)?.dispose();
+      }
+    }
+
+    for (final id in neededIds) {
+      if (_feeds.containsKey(id)) continue;
+      final camera = _camerasById[id];
+      if (camera != null) _openFeed(camera);
+    }
+
+    if (mounted) setState(() {});
+    _feedsVersion.value++;
+  }
+
+  void _openFeed(CctvCamera camera, {bool startDisconnected = false}) {
+    _ensureMediaKitReady();
+
+    if (camera.rtspUrl.isEmpty || camera.ip.isEmpty) {
+      final feed = _CameraFeed(camera)
+        ..hasError = true
+        ..isBuffering = false
+        ..errorMessage = 'No stream URL saved for this camera yet.';
+      _feeds[camera.id] = feed;
+      return;
+    }
+
+    final feed = _CameraFeed(camera);
+    if (startDisconnected) {
+      feed.hasError = true;
+      feed.isAutoRecoverable = true;
+      feed.disconnectedAt = DateTime.now();
+      feed.isBuffering = false;
+      feed.errorMessage = 'Camera disconnected';
+    }
+    _feeds[camera.id] = feed;
+
+    feed._errorSub = feed.player.stream.error.listen((error) {
+      if (!mounted) return;
+      setState(() {
+        feed.hasError = true;
+        feed.isAutoRecoverable = true;
+        feed.disconnectedAt = DateTime.now();
+        feed.isBuffering = false;
+        feed.errorMessage = error;
+        feed.recoveryCandidateSince = null;
+      });
+      _feedsVersion.value++;
+    });
+
+    feed._bufferingSub = feed.player.stream.buffering.listen((buffering) {
+      if (!mounted) return;
+      if (feed.hasError) return;
+      if (feed.isBuffering == buffering) return;
+      setState(() => feed.isBuffering = buffering);
+      _feedsVersion.value++;
+    });
+
+    feed._positionSub = feed.player.stream.position.listen((_) {
+      final now = DateTime.now();
+      feed.lastActivityAt = now;
+
+      if (!feed.hasError) {
+        feed.recoveryCandidateSince = null;
+        return;
+      }
+
+      feed.recoveryCandidateSince ??= now;
+      final sustained = now.difference(feed.recoveryCandidateSince!) >=
+          _recoverySustainDuration;
+
+      if (sustained && mounted) {
+        setState(() {
+          feed.hasError = false;
+          feed.isAutoRecoverable = false;
+          feed.disconnectedAt = null;
+          feed.errorMessage = null;
+          feed.recoveryCandidateSince = null;
+        });
+        _feedsVersion.value++;
+      }
+    });
+
+    try {
+      feed.player.open(Media(camera.rtspUrl));
+    } catch (e) {
+      feed.hasError = true;
+      feed.errorMessage = e.toString();
+    }
+  }
+
+  void _retryFeed(CctvCamera camera) {
+    _feeds.remove(camera.id)?.dispose();
+    setState(() {
+      _openFeed(camera, startDisconnected: true);
+    });
+    _feedsVersion.value++;
+  }
+
+  void _applyLayout(CameraLayoutScheme layout) {
+    setState(() {
+      _zoomedCameraId = null;
+      _currentLayout = layout;
+    });
+    _syncFeedsToLayout();
+  }
+
+  /// Opens a single camera by itself, without needing a saved layout.
+  /// This builds a throwaway 1x1 scheme (isPreset: true) so it's never
+  /// written to `camera_layouts` — it just becomes the current view.
+  void _viewSingleCamera(CctvCamera camera) {
+    _applyLayout(
+      CameraLayoutScheme(
+        id: 'single_${camera.id}',
+        name: camera.name,
+        columns: 1,
+        rows: 1,
+        slotCameraIds: [camera.id],
+        isPreset: true,
+      ),
+    );
+  }
+
+  Future<void> _openLayoutManager() async {
+    setState(() => _layoutManagerOpen = true);
+    final result = await showModalBottomSheet<CameraLayoutScheme>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      isDismissible: true,
+      enableDrag: true,
+      builder: (_) => _LayoutEditorDialog(
+        allCameras: widget.cameras,
+        savedLayouts: _customLayouts,
+        onDelete: (layout) async {
+          setState(() => _customLayouts.removeWhere((l) => l.id == layout.id));
+          await _deleteLayoutRemote(layout);
+        },
+      ),
+    );
+    setState(() => _layoutManagerOpen = false);
+    if (result == null) return;
+
+    if (result.isPreset) {
+      _applyLayout(result);
+      return;
+    }
+
+    final saved = await _upsertLayoutRemote(result);
+    final finalLayout = saved ?? result;
+
+    setState(() {
+      final existingIndex =
+          _customLayouts.indexWhere((l) => l.id == result.id);
+      if (existingIndex >= 0) {
+        _customLayouts[existingIndex] = finalLayout;
+      } else {
+        _customLayouts.add(finalLayout);
+      }
+    });
+    _applyLayout(finalLayout);
+  }
+
+  void _toggleZoom(String cameraId) {
+    setState(() {
+      _zoomedCameraId = _zoomedCameraId == cameraId ? null : cameraId;
+    });
+  }
+
+  Future<void> _openLayoutFullscreen() async {
+    final returnedZoomId = await Navigator.of(context).push<String?>(
+      _instantRoute(
+        (_) => _LayoutFullscreenPage(
+          layout: _currentLayout,
+          camerasById: _camerasById,
+          feeds: _feeds,
+          feedsVersion: _feedsVersion,
+          initialZoomedCameraId: _zoomedCameraId,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    setState(() => _zoomedCameraId = returnedZoomId);
+  }
+
+  @override
+  void dispose() {
+    _watchdogTimer?.cancel();
+    _feedsVersion.dispose();
+    for (final feed in _feeds.values) {
+      feed.dispose();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.cameras.isEmpty) {
+      // Kept as the original fixed dark "monitor with no signal" look on
+      // purpose — this is the video wall with nothing plugged in, so it
+      // stays black in both light and dark app themes, exactly like it
+      // did before this screen picked up theme support.
+      return const ColoredBox(
+        color: Colors.black,
+        child: Center(
+          child: Text(
+            'No cameras configured yet.',
+            style: TextStyle(color: Colors.white70, fontSize: 16),
+          ),
+        ),
+      );
+    }
+
+    // The video wall itself (grid background, tiles, overlay controls)
+    // stays black regardless of app theme — same reasoning as any
+    // security-monitor wall: it's built to frame video, not to be a page
+    // background. Theme support below applies to the surrounding chrome:
+    // the navigator sidebar, its toggle tab, and the layout manager.
+    return Container(
+      color: Colors.black,
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: _zoomedCameraId != null ? _buildZoomedView() : _buildGrid(),
+          ),
+          AnimatedPositioned(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOut,
+            top: 0,
+            bottom: 0,
+            right: _sidePanelOpen ? 0 : -_sidePanelWidth,
+            width: _sidePanelWidth,
+            child: _buildSidePanel(),
+          ),
+          AnimatedPositioned(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOut,
+            top: 12,
+            right: _sidePanelOpen ? _sidePanelWidth : 0,
+            child: _buildToggleTab(),
+          ),
+          if (!_layoutManagerOpen && !_sidePanelOpen)
+            Positioned(
+              bottom: 12,
+              right: 12,
+              child: SafeArea(
+                child: _RoundIconButton(
+                  icon: Icons.fullscreen,
+                  onTap: _openLayoutFullscreen,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildToggleTab() {
+    return Material(
+      color: AppColors.card(context),
+      borderRadius: const BorderRadius.horizontal(left: Radius.circular(8)),
+      child: InkWell(
+        borderRadius: const BorderRadius.horizontal(left: Radius.circular(8)),
+        onTap: () => setState(() => _sidePanelOpen = !_sidePanelOpen),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 14),
+          decoration: BoxDecoration(
+            border: Border(
+              top: BorderSide(color: AppColors.border(context)),
+              left: BorderSide(color: AppColors.border(context)),
+              bottom: BorderSide(color: AppColors.border(context)),
+            ),
+          ),
+          child: Icon(
+            _sidePanelOpen ? Icons.chevron_right : Icons.chevron_left,
+            color: AppColors.textMuted(context),
+            size: 20,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSidePanel() {
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.card(context),
+        border: Border(left: BorderSide(color: AppColors.border(context))),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.35),
+            blurRadius: 18,
+            offset: const Offset(-4, 0),
+          ),
+        ],
+      ),
+      padding: const EdgeInsets.fromLTRB(14, 18, 14, 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.view_quilt_outlined,
+                  size: 15, color: AppColors.textMuted(context)),
+              const SizedBox(width: 8),
+              Text(
+                'NAVIGATOR',
+                style: TextStyle(
+                  color: AppColors.textMuted(context),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Expanded(
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                _buildLayoutsSection(),
+                const SizedBox(height: 8),
+                _buildCamerasSection(),
+              ],
+            ),
+          ),
+          Divider(color: AppColors.border(context), height: 24),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _openLayoutManager,
+              icon: const Icon(Icons.dashboard_customize_outlined, size: 16),
+              label: const Text('Layout Manager',
+                  style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12.5)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.accentBlue,
+                foregroundColor: Colors.white,
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _collapsibleSection({
+    required String title,
+    required List<Widget> children,
+    bool initiallyExpanded = true,
+  }) {
+    return Theme(
+      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+      child: ExpansionTile(
+        initiallyExpanded: initiallyExpanded,
+        tilePadding: EdgeInsets.zero,
+        childrenPadding: const EdgeInsets.only(top: 4, bottom: 6),
+        iconColor: AppColors.textMuted(context),
+        collapsedIconColor: AppColors.textMuted(context),
+        title: Text(
+          title,
+          style: TextStyle(
+            color: AppColors.textMuted(context),
+            fontSize: 10.5,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 1,
+          ),
+        ),
+        children: children,
+      ),
+    );
+  }
+
+  /// A single flat list of saved layouts, each row showing its name and a
+  /// small "columns×rows" badge — no nested sub-groups, sorted smallest
+  /// grid first so it reads top-to-bottom cleanly.
+  Widget _buildLayoutsSection() {
+    final layouts = List<CameraLayoutScheme>.from(_customLayouts)
+      ..sort((a, b) {
+        final bySize = (a.columns * a.rows).compareTo(b.columns * b.rows);
+        if (bySize != 0) return bySize;
+        return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      });
+
+    return _collapsibleSection(
+      title: 'LAYOUTS',
+      children: layouts.isEmpty
+          ? [
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Text(
+                  'No layouts yet. Use Layout Manager below to '
+                  'create one and choose which camera goes in '
+                  'each slot.',
+                  style: TextStyle(
+                      color: AppColors.textMuted(context),
+                      fontSize: 12,
+                      height: 1.4),
+                ),
+              ),
+            ]
+          : [
+              for (final layout in layouts)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: _NavRow(
+                    label: layout.name,
+                    icon: Icons.grid_view_rounded,
+                    badge: '${layout.columns}\u00d7${layout.rows}',
+                    selected: _currentLayout.id == layout.id,
+                    onTap: () => _applyLayout(layout),
+                  ),
+                ),
+            ],
+    );
+  }
+
+  /// CAMERAS > every individual camera — tapping one opens it by itself,
+  /// without needing to build or save a layout.
+  Widget _buildCamerasSection() {
+    return _collapsibleSection(
+      title: 'CAMERAS',
+      initiallyExpanded: false,
+      children: widget.cameras.isEmpty
+          ? [
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Text(
+                  'No cameras configured yet.',
+                  style: TextStyle(color: AppColors.textMuted(context), fontSize: 12),
+                ),
+              ),
+            ]
+          : [
+              for (final camera in widget.cameras)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: _NavRow(
+                    label: camera.name,
+                    icon: Icons.videocam_rounded,
+                    selected: _currentLayout.id == 'single_${camera.id}',
+                    onTap: () => _viewSingleCamera(camera),
+                  ),
+                ),
+            ],
+    );
+  }
+
+  Widget _buildZoomedView() {
+    final cameraId = _zoomedCameraId!;
+    final camera = _camerasById[cameraId];
+    final feed = _feeds[cameraId];
+    if (camera == null) {
+      return const Center(
+        child: Text('Camera not found', style: TextStyle(color: Colors.white54)),
+      );
+    }
+    return _CameraTile(
+      camera: camera,
+      feed: feed,
+      onDoubleTap: () => _toggleZoom(cameraId),
+    );
+  }
+
+  Widget _buildGrid() {
+    final layout = _currentLayout;
+    const spacing = 1.0;
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final cellWidth =
+            (constraints.maxWidth - (layout.columns - 1) * spacing) /
+                layout.columns;
+        final cellHeight =
+            (constraints.maxHeight - (layout.rows - 1) * spacing) /
+                layout.rows;
+        final aspectRatio = cellWidth / cellHeight;
+
+        return GridView.builder(
+          padding: EdgeInsets.zero,
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: layout.columns,
+            crossAxisSpacing: spacing,
+            mainAxisSpacing: spacing,
+            childAspectRatio: aspectRatio,
+          ),
+          itemCount: layout.slotCount,
+          itemBuilder: (context, index) {
+            final cameraId = layout.slotCameraIds[index];
+            final camera = cameraId != null ? _camerasById[cameraId] : null;
+
+            if (camera == null) {
+              return const _EmptySlotTile();
+            }
+
+            final feed = _feeds[camera.id];
+            return _CameraTile(
+              camera: camera,
+              feed: feed,
+              onDoubleTap: layout.slotCount > 1
+                  ? () => _toggleZoom(camera.id)
+                  : null,
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+/// Clean, flat navigator row used for both the Layouts and Cameras lists —
+/// an icon, a label, an optional size badge, and a selected state. Follows
+/// the app's light/dark tokens so it matches the rest of the admin UI.
+class _NavRow extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final bool selected;
+  final VoidCallback onTap;
+  final String? badge;
+
+  const _NavRow({
+    required this.label,
+    required this.icon,
+    required this.selected,
+    required this.onTap,
+    this.badge,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+        decoration: BoxDecoration(
+          color: selected
+              ? AppColors.accentBlue.withOpacity(0.14)
+              : AppColors.sunken(context),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: selected ? AppColors.accentBlue : AppColors.border(context),
+            width: 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              icon,
+              size: 15,
+              color: selected ? AppColors.accentBlue : AppColors.textMuted(context),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                label,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: selected ? AppColors.accentBlue : AppColors.textMain(context),
+                  fontSize: 12.5,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                ),
+              ),
+            ),
+            if (badge != null) ...[
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: AppColors.border(context),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  badge!,
+                  style: TextStyle(
+                    color: AppColors.textMuted(context),
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _EmptySlotTile extends StatelessWidget {
+  const _EmptySlotTile();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF0D0D0D),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: const Center(
+        child: Icon(Icons.videocam_outlined, color: Colors.white24, size: 22),
+      ),
+    );
+  }
+}
+
+class _RoundIconButton extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback onTap;
+  final double size;
+
+  const _RoundIconButton({
+    required this.icon,
+    required this.onTap,
+    this.size = 18,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black45,
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(6),
+          child: Icon(icon, color: Colors.white, size: size),
+        ),
+      ),
+    );
+  }
+}
+
+/// Compact icon button used inside the per-tile bottom toolbar — smaller
+/// and flatter than [_RoundIconButton], sized to sit in a 26px-tall bar.
+class _TileToolbarButton extends StatefulWidget {
+  final IconData icon;
+  final VoidCallback onTap;
+  final Color? iconColor;
+
+  const _TileToolbarButton({
+    required this.icon,
+    required this.onTap,
+    this.iconColor,
+  });
+
+  @override
+  State<_TileToolbarButton> createState() => _TileToolbarButtonState();
+}
+
+class _TileToolbarButtonState extends State<_TileToolbarButton> {
+  bool _isHovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 100),
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+          decoration: BoxDecoration(
+            color: _isHovered ? Colors.white.withOpacity(0.15) : Colors.transparent,
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Icon(
+            widget.icon,
+            size: 15,
+            color: widget.iconColor ?? Colors.white70,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Small dark-strip pill used to host a status icon/badge (recording,
+/// unmuted, etc.) in a tile's top-right corner — same fill color as the
+/// bottom toolbar so status indicators read as one consistent style.
+class _StatusChip extends StatelessWidget {
+  final Widget child;
+  const _StatusChip({required this.child});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+      decoration: BoxDecoration(
+        color: const Color(0xCC1B1D21),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: child,
+    );
+  }
+}
+
+/// Small pulsing-dot + "REC" label shown on a tile while it's being saved
+/// locally, so recording status is visible even with the toolbar hidden.
+class _RecBadge extends StatefulWidget {
+  const _RecBadge();
+
+  @override
+  State<_RecBadge> createState() => _RecBadgeState();
+}
+
+class _RecBadgeState extends State<_RecBadge>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        FadeTransition(
+          opacity: Tween<double>(begin: 1, end: 0.3).animate(_controller),
+          child: const DecoratedBox(
+            decoration: BoxDecoration(
+              color: Colors.redAccent,
+              shape: BoxShape.circle,
+            ),
+            child: SizedBox(width: 7, height: 7),
+          ),
+        ),
+        const SizedBox(width: 4),
+        const Text(
+          'REC',
+          style: TextStyle(
+            color: Colors.redAccent,
+            fontSize: 10,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0.5,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _CameraTile extends StatefulWidget {
+  final CctvCamera camera;
+  final _CameraFeed? feed;
+  final VoidCallback? onDoubleTap;
+  final bool cursorHidden;
+
+  const _CameraTile({
+    required this.camera,
+    required this.feed,
+    this.onDoubleTap,
+    this.cursorHidden = false,
+  });
+
+  @override
+  State<_CameraTile> createState() => _CameraTileState();
+}
+
+class _CameraTileState extends State<_CameraTile> {
+  bool _controlsVisible = false;
+
+  void _handleEnter(PointerEvent details) {
+    final feed = widget.feed;
+    if (feed == null || feed.hasError) return;
+    setState(() => _controlsVisible = true);
+  }
+
+  void _handleExit(PointerEvent details) {
+    setState(() => _controlsVisible = false);
+  }
+
+  void _handleToggleMute() {
+    final feed = widget.feed;
+    if (feed == null) return;
+    feed.toggleMute();
+    setState(() {});
+  }
+
+  Future<void> _handleToggleRecord() async {
+    final feed = widget.feed;
+    if (feed == null || feed.hasError) return;
+
+    if (!_isDesktopPlatform) {
+      return;
+    }
+
+    if (feed.isRecording) {
+      await feed.stopRecording();
+    } else {
+      final path = await _newRecordingFilePath(feed.camera);
+      await feed.startRecording(path);
+    }
+    
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final camera = widget.camera;
+    final feed = widget.feed;
+    final controlsVisible = _controlsVisible && !widget.cursorHidden;
+
+    return MouseRegion(
+      onEnter: _handleEnter,
+      onExit: _handleExit,
+      child: GestureDetector(
+        onDoubleTap: widget.onDoubleTap,
+        behavior: HitTestBehavior.opaque,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+
+            if (feed != null && !feed.hasError)
+              Video(
+                controller: feed.controller,
+                fit: BoxFit.fill,
+                controls: NoVideoControls,
+              )
+            else
+              const ColoredBox(color: Colors.black),
+
+            _DetectionOverlay(cameraId: camera.id),
+            _AlertBanner(cameraId: camera.id),
+
+            Positioned(
+              left: 6,
+              top: 4,
+              child: Text(
+                camera.name,
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 11,
+                  shadows: [Shadow(blurRadius: 4, color: Colors.black)],
+                ),
+              ),
+            ),
+
+            // Persistent status badges — recording / unmuted — stacked in the
+            // top-right as small dark-strip chips.
+            if (feed != null && (feed.isRecording || !feed.isMuted))
+              Positioned(
+                right: 6,
+                top: 4,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    if (feed.isRecording) const _StatusChip(child: _RecBadge()),
+                    if (feed.isRecording && !feed.isMuted)
+                      const SizedBox(height: 4),
+                    if (!feed.isMuted)
+                      const _StatusChip(
+                        child: Icon(Icons.volume_up, size: 12, color: Colors.white),
+                      ),
+                  ],
+                ),
+              ),
+
+            if (feed != null && !feed.hasError) ...[
+              // Bottom toolbar bar — revealed on hover
+              AnimatedOpacity(
+                opacity: controlsVisible ? 1 : 0,
+                duration: const Duration(milliseconds: 150),
+                child: IgnorePointer(
+                  ignoring: !controlsVisible,
+                  child: Align(
+                    alignment: Alignment.bottomCenter,
+                    child: Container(
+                      width: double.infinity,
+                      height: 26,
+                      alignment: Alignment.centerRight,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      color: const Color(0xCC1B1D21),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _TileToolbarButton(
+                            icon: feed.isMuted ? Icons.volume_off : Icons.volume_up,
+                            onTap: _handleToggleMute,
+                          ),
+                          Container(
+                            width: 1,
+                            height: 14,
+                            margin: const EdgeInsets.symmetric(horizontal: 8),
+                            color: Colors.white24,
+                          ),
+                          _TileToolbarButton(
+                            icon: feed.isRecording
+                                ? Icons.stop_circle_rounded
+                                : Icons.fiber_manual_record,
+                            iconColor:
+                                feed.isRecording ? Colors.redAccent : Colors.white70,
+                            onTap: _handleToggleRecord,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              // Blue selection border — shown while hovering over the tile
+              AnimatedOpacity(
+                opacity: controlsVisible ? 1 : 0,
+                duration: const Duration(milliseconds: 150),
+                child: IgnorePointer(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.blueAccent, width: 1),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+
+            if (!(feed?.hasError ?? false) && (feed?.isBuffering ?? true))
+              const Center(
+                child: SizedBox(
+                  width: 28,
+                  height: 28,
+                  child: CircularProgressIndicator(strokeWidth: 2.5),
+                ),
+              ),
+
+            if (feed?.hasError ?? false)
+              Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.videocam_off,
+                      color: Colors.redAccent.withOpacity(0.85),
+                      size: 30,
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'CAMERA DISCONNECTED',
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.5,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    if (feed!.isAutoRecoverable)
+                      const Text(
+                        'Reconnecting…',
+                        style: TextStyle(color: Colors.white38, fontSize: 11),
+                      )
+                    else if ((feed!.errorMessage ?? '').isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        child: Text(
+                          feed!.errorMessage!,
+                          maxLines: 2,
+                          textAlign: TextAlign.center,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: Colors.white38, fontSize: 10),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Live YOLO person-detection overlay
+// ---------------------------------------------------------------------------
+
+class _DetectionOverlay extends StatelessWidget {
+  final String cameraId;
+  const _DetectionOverlay({required this.cameraId});
+ 
+  static const Duration _staleness = Duration(seconds: 3);
+ 
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<List<Map<String, dynamic>>>(
+      stream: Supabase.instance.client
+          .from('camera_detections')
+          .stream(primaryKey: ['camera_id'])
+          .eq('camera_id', cameraId),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData || snapshot.data!.isEmpty) {
+          return const SizedBox.shrink();
+        }
+        final data = snapshot.data!.first;
+        final rawBoxes = (data['detections'] as List?) ?? const [];
+        final updatedAtStr = data['updated_at']?.toString();
+        final updatedAt =
+            updatedAtStr != null ? DateTime.tryParse(updatedAtStr)?.toLocal() : null;
+ 
+        if (updatedAt == null || DateTime.now().difference(updatedAt) > _staleness) {
+          return const SizedBox.shrink();
+        }
+ 
+        final boxes = rawBoxes
+            .whereType<Map>()
+            .map((b) => _DetectionBox(
+                  x1: (b['x1'] as num).toDouble(),
+                  y1: (b['y1'] as num).toDouble(),
+                  x2: (b['x2'] as num).toDouble(),
+                  y2: (b['y2'] as num).toDouble(),
+                  conf: (b['conf'] as num).toDouble(),
+                  cls: (b['cls'] as String?) ?? 'person',
+                ))
+            .toList();
+ 
+        return IgnorePointer(
+          child: CustomPaint(
+            painter: _DetectionBoxPainter(boxes),
+            size: Size.infinite,
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _DetectionBox {
+  final double x1, y1, x2, y2, conf;
+  final String cls;
+  const _DetectionBox({
+    required this.x1,
+    required this.y1,
+    required this.x2,
+    required this.y2,
+    required this.conf,
+    required this.cls,
+  });
+}
+
+class _DetectionBoxPainter extends CustomPainter {
+  final List<_DetectionBox> boxes;
+  _DetectionBoxPainter(this.boxes);
+
+  static const Map<String, Color> _classColors = {
+    'person': Color(0xFF00E676),
+    'car': Color(0xFFFFC400),
+  };
+
+  static const Map<String, String> _classLabels = {
+    'person': 'Person',
+    'car': 'Car',
+  };
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    for (final box in boxes) {
+      final color = _classColors[box.cls] ?? Colors.grey;
+      final displayLabel = _classLabels[box.cls] ?? box.cls;
+
+      final boxPaint = Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2;
+
+      final rect = Rect.fromLTRB(
+        box.x1 * size.width,
+        box.y1 * size.height,
+        box.x2 * size.width,
+        box.y2 * size.height,
+      );
+      canvas.drawRect(rect, boxPaint);
+
+      final label = '$displayLabel ${(box.conf * 100).toStringAsFixed(0)}%';
+      final textPainter = TextPainter(
+        text: TextSpan(
+          text: label,
+          style: const TextStyle(
+            color: Colors.black,
+            fontSize: 10,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+
+      final labelTop = (rect.top - 14).clamp(0.0, size.height - 14);
+      final labelBg = Rect.fromLTWH(
+        rect.left,
+        labelTop,
+        textPainter.width + 6,
+        14,
+      );
+      canvas.drawRect(labelBg, Paint()..color = color);
+      textPainter.paint(canvas, Offset(labelBg.left + 3, labelBg.top + 1));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DetectionBoxPainter oldDelegate) => true;
+}
+
+class _AlertBanner extends StatelessWidget {
+  final String cameraId;
+  const _AlertBanner({required this.cameraId});
+ 
+  static const Duration _staleness = Duration(seconds: 3);
+ 
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<List<Map<String, dynamic>>>(
+      stream: Supabase.instance.client
+          .from('camera_detections')
+          .stream(primaryKey: ['camera_id'])
+          .eq('camera_id', cameraId),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData || snapshot.data!.isEmpty) {
+          return const SizedBox.shrink();
+        }
+        final data = snapshot.data!.first;
+        final alertType = data['active_alert_type'] as String?;
+        final updatedAtStr = data['updated_at']?.toString();
+        final updatedAt =
+            updatedAtStr != null ? DateTime.tryParse(updatedAtStr)?.toLocal() : null;
+ 
+        if (alertType == null ||
+            updatedAt == null ||
+            DateTime.now().difference(updatedAt) > _staleness) {
+          return const SizedBox.shrink();
+        }
+ 
+        final level = AlertLevel.fromString(data['active_alert_level'] as String?) ??
+            AlertLevel.forAlertType(alertType);
+        final color = level.color;
+ 
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            // Subtle border, no shadow/glow
+            IgnorePointer(
+              child: Container(
+                decoration: BoxDecoration(
+                  border: Border.all(color: color, width: 2),
+                ),
+              ),
+            ),
+            // Small label chip, top-left
+            Positioned(
+              right: 6,
+              bottom: 6,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: color,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  _shortLabel(alertType),
+                  style: const TextStyle(
+                    color: Colors.black87,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 0.3,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+ 
+  String _shortLabel(String alertType) => switch (alertType) {
+        'Accident' => 'POSSIBLE ACCIDENT',
+        'Violence' => 'POSSIBLE VIOLENCE',
+        'fire' => 'POSSIBLE FIRE',
+        'curfew' => 'POSSIBLE CURFEW',
+        'traffic' => 'POSSIBLE TRAFFIC',
+        _ => alertType.toUpperCase(),
+      };
+}
+
+// ---------------------------------------------------------------------------
+// Dedicated fullscreen page
+// ---------------------------------------------------------------------------
+
+class _LayoutFullscreenPage extends StatefulWidget {
+  final CameraLayoutScheme layout;
+  final Map<String, CctvCamera> camerasById;
+  final Map<String, _CameraFeed> feeds;
+  final ValueNotifier<int> feedsVersion;
+  final String? initialZoomedCameraId;
+
+  const _LayoutFullscreenPage({
+    required this.layout,
+    required this.camerasById,
+    required this.feeds,
+    required this.feedsVersion,
+    this.initialZoomedCameraId,
+  });
+
+  @override
+  State<_LayoutFullscreenPage> createState() => _LayoutFullscreenPageState();
+}
+
+class _LayoutFullscreenPageState extends State<_LayoutFullscreenPage> {
+  late String? _zoomedCameraId = widget.initialZoomedCameraId;
+
+  Timer? _cursorHideTimer;
+  bool _cursorVisible = true;
+  static const Duration _cursorHideDelay = Duration(seconds: 3);
+
+  final FocusNode _focusNode = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    if (_isDesktopPlatform) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        try {
+          await windowManager.setTitleBarStyle(TitleBarStyle.hidden);
+          await windowManager.setFullScreen(true);
+        } catch (e, st) {
+          debugPrint('>>> fullscreen setup FAILED: $e\n$st');
+        }
+      });
+    } else {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
+    _scheduleCursorHide();
+  }
+
+  void _handlePointerHover([PointerEvent? _]) {
+    if (!_cursorVisible) {
+      setState(() => _cursorVisible = true);
+    }
+    _scheduleCursorHide();
+  }
+
+  void _scheduleCursorHide() {
+    _cursorHideTimer?.cancel();
+    _cursorHideTimer = Timer(_cursorHideDelay, () {
+      if (mounted) setState(() => _cursorVisible = false);
+    });
+  }
+
+  @override
+  void dispose() {
+    _cursorHideTimer?.cancel();
+    _focusNode.dispose();
+    if (_isDesktopPlatform) {
+      windowManager.setFullScreen(false);
+      windowManager.setTitleBarStyle(TitleBarStyle.normal);
+    } else {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    }
+    super.dispose();
+  }
+
+  void _toggleZoom(String cameraId) {
+    setState(() {
+      _zoomedCameraId = _zoomedCameraId == cameraId ? null : cameraId;
+    });
+  }
+
+  void _pop() {
+    Navigator.of(context).pop(_zoomedCameraId);
+  }
+
+  KeyEventResult _handleKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is KeyDownEvent &&
+        event.logicalKey == LogicalKeyboardKey.escape) {
+      _pop();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope<String?>(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        _pop();
+      },
+      child: Focus(
+        focusNode: _focusNode,
+        autofocus: true,
+        onKeyEvent: _handleKeyEvent,
+        child: MouseRegion(
+          cursor: _cursorVisible ? SystemMouseCursors.basic : SystemMouseCursors.none,
+          onHover: _handlePointerHover,
+          child: Scaffold(
+            backgroundColor: Colors.black,
+            body: ValueListenableBuilder<int>(
+              valueListenable: widget.feedsVersion,
+              builder: (context, _, __) {
+                return _zoomedCameraId != null ? _buildZoomedView() : _buildGrid();
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildZoomedView() {
+    final cameraId = _zoomedCameraId!;
+    final camera = widget.camerasById[cameraId];
+    final feed = widget.feeds[cameraId];
+    if (camera == null) {
+      return const Center(
+        child: Text('Camera not found', style: TextStyle(color: Colors.white54)),
+      );
+    }
+    return _CameraTile(
+      camera: camera,
+      feed: feed,
+      onDoubleTap: () => _toggleZoom(cameraId),
+      cursorHidden: !_cursorVisible,
+    );
+  }
+
+  Widget _buildGrid() {
+    final layout = widget.layout;
+    const spacing = 1.0;
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final cellWidth =
+            (constraints.maxWidth - (layout.columns - 1) * spacing) /
+                layout.columns;
+        final cellHeight =
+            (constraints.maxHeight - (layout.rows - 1) * spacing) /
+                layout.rows;
+        final aspectRatio = cellWidth / cellHeight;
+
+        return GridView.builder(
+          padding: EdgeInsets.zero,
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: layout.columns,
+            crossAxisSpacing: spacing,
+            mainAxisSpacing: spacing,
+            childAspectRatio: aspectRatio,
+          ),
+          itemCount: layout.slotCount,
+          itemBuilder: (context, index) {
+            final cameraId = layout.slotCameraIds[index];
+            final camera =
+                cameraId != null ? widget.camerasById[cameraId] : null;
+
+            if (camera == null) {
+              return const _EmptySlotTile();
+            }
+
+            final feed = widget.feeds[camera.id];
+            return _CameraTile(
+              camera: camera,
+              feed: feed,
+              onDoubleTap: layout.slotCount > 1
+                  ? () => _toggleZoom(camera.id)
+                  : null,
+              cursorHidden: !_cursorVisible,
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Layout editor dialog
+// ---------------------------------------------------------------------------
+
+class _LayoutEditorDialog extends StatefulWidget {
+  final List<CctvCamera> allCameras;
+  final List<CameraLayoutScheme> savedLayouts;
+  final Future<void> Function(CameraLayoutScheme) onDelete;
+
+  const _LayoutEditorDialog({
+    required this.allCameras,
+    required this.savedLayouts,
+    required this.onDelete,
+  });
+
+  @override
+  State<_LayoutEditorDialog> createState() => _LayoutEditorDialogState();
+}
+
+class _LayoutEditorDialogState extends State<_LayoutEditorDialog> {
+  static const int _defaultColumns = 2;
+  static const int _defaultRows = 2;
+
+  late int _columns;
+  late int _rows;
+  late List<String?> _slots;
+  late TextEditingController _nameController;
+
+  String? _editingId;
+
+  @override
+  void initState() {
+    super.initState();
+    _nameController = TextEditingController();
+    _editingId = null;
+    _columns = _defaultColumns;
+    _rows = _defaultRows;
+    _slots = List<String?>.filled(_defaultColumns * _defaultRows, null);
+  }
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    super.dispose();
+  }
+
+  void _resetToNew() {
+    setState(() {
+      _editingId = null;
+      _columns = _defaultColumns;
+      _rows = _defaultRows;
+      _slots = List<String?>.filled(_defaultColumns * _defaultRows, null);
+      _nameController.text = '';
+    });
+  }
+
+  void _loadForEditing(CameraLayoutScheme layout) {
+    setState(() {
+      _editingId = layout.id;
+      _columns = layout.columns;
+      _rows = layout.rows;
+      _slots = List<String?>.from(layout.slotCameraIds);
+      _nameController.text = layout.name;
+    });
+  }
+
+  void _setGridSize(int columns, int rows) {
+    setState(() {
+      final newSlotCount = columns * rows;
+      final resized = List<String?>.filled(newSlotCount, null);
+      for (var i = 0; i < _slots.length && i < newSlotCount; i++) {
+        resized[i] = _slots[i];
+      }
+      _columns = columns;
+      _rows = rows;
+      _slots = resized;
+    });
+  }
+
+  Future<void> _assignSlot(int index) async {
+    final chosenId = await showModalBottomSheet<String?>(
+      context: context,
+      backgroundColor: AppColors.card(context),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => _CameraPickerSheet(cameras: widget.allCameras),
+    );
+    if (chosenId == null) return;
+    setState(() {
+      if (chosenId.isEmpty) {
+        _slots[index] = null;
+      } else {
+        for (var i = 0; i < _slots.length; i++) {
+          if (_slots[i] == chosenId) _slots[i] = null;
+        }
+        _slots[index] = chosenId;
+      }
+    });
+  }
+
+  void _save() {
+    final name = _nameController.text.trim();
+    final layout = CameraLayoutScheme(
+      id: _editingId ?? DateTime.now().millisecondsSinceEpoch.toString(),
+      name: name.isEmpty ? '$_columns x $_rows' : name,
+      columns: _columns,
+      rows: _rows,
+      slotCameraIds: _slots,
+      isPreset: false,
+    );
+    Navigator.of(context).pop(layout);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final camerasById = {for (final c in widget.allCameras) c.id: c};
+    final mediaQuery = MediaQuery.of(context);
+
+    return Padding(
+      padding: EdgeInsets.only(bottom: mediaQuery.viewInsets.bottom),
+      child: FractionallySizedBox(
+        heightFactor: 0.88,
+        alignment: Alignment.bottomCenter,
+        child: Container(
+          decoration: BoxDecoration(
+            color: AppColors.card(context),
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
+            border: Border.all(color: AppColors.border(context)),
+          ),
+          child: SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 36,
+                      height: 4,
+                      margin: const EdgeInsets.only(bottom: 14),
+                      decoration: BoxDecoration(
+                        color: AppColors.border(context),
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Expanded(
+                        child: Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: AppColors.accentBlue.withOpacity(0.12),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: const Icon(Icons.dashboard_customize_outlined,
+                                  color: AppColors.accentBlue, size: 16),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                _editingId == null
+                                    ? 'New Layout'
+                                    : 'Editing "${_nameController.text}"',
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: AppColors.textMain(context),
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (_editingId != null)
+                        TextButton.icon(
+                          onPressed: _resetToNew,
+                          icon: const Icon(Icons.add, size: 16, color: AppColors.accentBlue),
+                          label: const Text('New',
+                              style: TextStyle(
+                                  color: AppColors.accentBlue, fontWeight: FontWeight.w600)),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      for (final preset in CameraLayoutScheme.presetSizes)
+                        ChoiceChip(
+                          label: Text(preset.label),
+                          selected:
+                              _columns == preset.columns && _rows == preset.rows,
+                          onSelected: (_) =>
+                              _setGridSize(preset.columns, preset.rows),
+                          backgroundColor: AppColors.sunken(context),
+                          selectedColor: AppColors.accentBlue,
+                          labelStyle: TextStyle(
+                            color: (_columns == preset.columns &&
+                                    _rows == preset.rows)
+                                ? Colors.white
+                                : AppColors.textMuted(context),
+                            fontWeight: FontWeight.w600,
+                            fontSize: 12,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(6),
+                            side: BorderSide(color: AppColors.border(context)),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  Text(
+                    'Tap a slot to assign a camera',
+                    style: TextStyle(color: AppColors.textMuted(context), fontSize: 11.5),
+                  ),
+                  const SizedBox(height: 8),
+                  Expanded(
+                    child: GridView.builder(
+                      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: _columns,
+                        crossAxisSpacing: 6,
+                        mainAxisSpacing: 6,
+                        childAspectRatio: 16 / 9,
+                      ),
+                      itemCount: _columns * _rows,
+                      itemBuilder: (context, index) {
+                        final cameraId = _slots[index];
+                        final camera =
+                            cameraId != null ? camerasById[cameraId] : null;
+                        return InkWell(
+                          onTap: () => _assignSlot(index),
+                          borderRadius: BorderRadius.circular(8),
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: camera != null
+                                  ? AppColors.accentBlue.withOpacity(0.12)
+                                  : AppColors.sunken(context),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: camera != null
+                                    ? AppColors.accentBlue.withOpacity(0.4)
+                                    : AppColors.border(context),
+                              ),
+                            ),
+                            alignment: Alignment.center,
+                            padding: const EdgeInsets.all(6),
+                            child: camera != null
+                                ? Text(
+                                    camera.name,
+                                    textAlign: TextAlign.center,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      color: AppColors.textMain(context),
+                                      fontWeight: FontWeight.w600,
+                                      fontSize: 11,
+                                    ),
+                                  )
+                                : Icon(Icons.add,
+                                    size: 16, color: AppColors.textMuted(context)),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _nameController,
+                          onChanged: (_) => setState(() {}),
+                          style: TextStyle(color: AppColors.textMain(context), fontSize: 13),
+                          decoration: InputDecoration(
+                            labelText: 'Layout name',
+                            labelStyle:
+                                TextStyle(color: AppColors.textMuted(context), fontSize: 12),
+                            isDense: true,
+                            enabledBorder: UnderlineInputBorder(
+                              borderSide: BorderSide(color: AppColors.border(context)),
+                            ),
+                            focusedBorder: const UnderlineInputBorder(
+                              borderSide:
+                                  BorderSide(color: AppColors.accentBlue, width: 1.5),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      TextButton(
+                        onPressed: () => Navigator.of(context).pop(),
+                        child: Text('Cancel',
+                            style: TextStyle(
+                                color: AppColors.textMuted(context),
+                                fontWeight: FontWeight.w600)),
+                      ),
+                      const SizedBox(width: 4),
+                      ElevatedButton(
+                        onPressed: _save,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.accentBlue,
+                          foregroundColor: Colors.white,
+                          elevation: 0,
+                          padding:
+                              const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8)),
+                        ),
+                        child: const Text('Save & Apply',
+                            style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold)),
+                      ),
+                    ],
+                  ),
+                  if (widget.savedLayouts.isNotEmpty) ...[
+                    Divider(color: AppColors.border(context), height: 24),
+                    Text('SAVED LAYOUTS (tap to edit)',
+                        style: TextStyle(
+                            color: AppColors.textMuted(context),
+                            fontSize: 10.5,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.6)),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final layout in widget.savedLayouts)
+                          InputChip(
+                            label: Text(layout.name),
+                            selected: _editingId == layout.id,
+                            backgroundColor: AppColors.sunken(context),
+                            selectedColor: AppColors.accentBlue.withOpacity(0.18),
+                            labelStyle: TextStyle(
+                              color: _editingId == layout.id
+                                  ? AppColors.accentBlue
+                                  : AppColors.textMain(context),
+                              fontWeight: FontWeight.w600,
+                              fontSize: 12,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(6),
+                              side: BorderSide(
+                                color: _editingId == layout.id
+                                    ? AppColors.accentBlue
+                                    : AppColors.border(context),
+                              ),
+                            ),
+                            deleteIconColor: AppColors.textMuted(context),
+                            onDeleted: () async {
+                              final wasEditing = _editingId == layout.id;
+                              await widget.onDelete(layout);
+                              if (!mounted) return;
+                              if (wasEditing) {
+                                _resetToNew();
+                              } else {
+                                setState(() {});
+                              }
+                            },
+                            onPressed: () => _loadForEditing(layout),
+                          ),
+                      ],
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CameraPickerSheet extends StatelessWidget {
+  final List<CctvCamera> cameras;
+  const _CameraPickerSheet({required this.cameras});
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.only(top: 10, bottom: 4),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 36,
+              height: 4,
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: AppColors.border(context),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'ASSIGN CAMERA',
+                  style: TextStyle(
+                    color: AppColors.textMuted(context),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                children: [
+                  ListTile(
+                    leading: Icon(Icons.clear, color: AppColors.textMuted(context)),
+                    title: Text('Clear slot',
+                        style: TextStyle(
+                            color: AppColors.textMain(context),
+                            fontWeight: FontWeight.w600)),
+                    onTap: () => Navigator.of(context).pop(''),
+                  ),
+                  Divider(color: AppColors.border(context), height: 1),
+                  for (final camera in cameras)
+                    ListTile(
+                      leading: const Icon(Icons.videocam, color: AppColors.accentBlue),
+                      title: Text(camera.name,
+                          style: TextStyle(
+                              color: AppColors.textMain(context),
+                              fontWeight: FontWeight.w600)),
+                      subtitle: Text(camera.ip,
+                          style:
+                              TextStyle(color: AppColors.textMuted(context), fontSize: 12)),
+                      onTap: () => Navigator.of(context).pop(camera.id),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

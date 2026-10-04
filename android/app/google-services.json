@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1096827077084",
+    "project_id": "safewatch-notification",
+    "storage_bucket": "safewatch-notification.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1096827077084:android:6e77e5bbddddac1f190f19",
+        "android_client_info": {
+          "package_name": "com.example.safewatch"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCP-1gPYkvARDlgXgJNyk6O0s6fnPSOHkM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,5127 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:http/http.dart' as http;
+import 'package:intl/intl.dart';
+import 'package:latlong2/latlong.dart' as ll;
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import 'cctv_live_screen.dart' show CctvCamera, AlertLevel;
+import '../../constants/app_colors.dart';
+import '../../services/auto_dispatch_config.dart';
+import '../../services/incident_report_link_service.dart';
+import '../../widgets/app_toast.dart';
+import '../../services/pa_audio_service.dart';
+// INCIDENTS SCREEN (redesigned, simple cards + table)
+//
+// Camera LOCATION (cameras.location) is what users see everywhere on this
+// screen instead of the camera name — see `_cameraLabel` below. This requires
+// `CctvCamera` to expose a `location` field (String?).
+//
+// Task Force backup: this screen subscribes to `taskforce_requests` (see
+// taskforce_backup_migration.sql). The stream is intentionally UNFILTERED at
+// the query level — a server-side `.eq('status','pending')` on a realtime
+// stream can race with the channel's resync fetch and make banners flicker
+// away. Pending is filtered client-side wherever the stream is consumed.
+//
+// The backup-request entry point is a compact button in the toolbar
+// (`_BackupButton`) rather than a full-width banner, so the stat cards and the
+// grid/list keep their vertical space. Backup requests can only be
+// DISPATCHED from the drawer (there is no decline action).
+//
+// AUTO RESPONSE: runs on the server (Supabase pg_cron -> run_auto_dispatch()),
+// configured in Admin > Settings > Auto Response (`app_settings`, key
+// 'auto_dispatch'). This screen no longer dispatches anything automatically;
+// it just shows the resulting status changes through the realtime stream.
+//
+// FIELD REPORTS: this screen also streams `incident_reports` and groups them
+// by `incident_id`. Cards/rows show a report badge, the detail dialog lists
+// the linked reports, and tapping one asks IncidentReportLinkService to open
+// it on the Incident Reports screen. The reverse direction (report -> incident)
+// arrives via `_onLinkRequest`.
+//
+// NOTIFICATIONS: all user feedback goes through AppToast (theme-aware,
+// bottom-right, above every overlay on this screen).
+
+/// Row model for one entry in the `incidents` table.
+class _Incident {
+  final String id;
+  final String cameraId;
+  final String alertType;
+  final AlertLevel alertLevel;
+  final DateTime occurredAt;
+  final DateTime? createdAt;
+  final String imagePath;
+  final String? videoPath;
+  final String? status;
+  final double? confidence;
+  final List<String>? detectedObjects;
+
+  _Incident({
+    required this.id,
+    required this.cameraId,
+    required this.alertType,
+    required this.alertLevel,
+    required this.occurredAt,
+    required this.createdAt,
+    required this.imagePath,
+    required this.videoPath,
+    required this.status,
+    this.confidence,
+    this.detectedObjects,
+  });
+
+  factory _Incident.fromMap(Map<String, dynamic> row) {
+    return _Incident(
+      id: row['id'].toString(),
+      cameraId: row['camera_id'].toString(),
+      alertType: (row['alert_type'] ?? '').toString(),
+      alertLevel:
+          AlertLevel.fromString(row['alert_level'] as String?) ?? AlertLevel.priority,
+      occurredAt: DateTime.tryParse(row['occurred_at']?.toString() ?? '')?.toLocal() ??
+          DateTime.now(),
+      createdAt: DateTime.tryParse(row['created_at']?.toString() ?? '')?.toLocal(),
+      imagePath: (row['image_path'] ?? '').toString(),
+      videoPath: (row['video_path'] as String?)?.trim().isEmpty ?? true
+          ? null
+          : row['video_path'] as String?,
+      status: row['status'] as String?,
+      // Optional columns: `confidence` (0.0–1.0) and `detected_objects`
+      // (array of strings). Safely null if the columns don't exist.
+      confidence: (row['confidence'] as num?)?.toDouble(),
+      detectedObjects:
+          (row['detected_objects'] as List?)?.map((e) => e.toString()).toList(),
+    );
+  }
+
+  String get imageUrl => Supabase.instance.client.storage
+      .from('incidents')
+      .getPublicUrl(imagePath);
+
+  String? get videoUrl => videoPath == null
+      ? null
+      : Supabase.instance.client.storage
+          .from('incidents')
+          .getPublicUrl(videoPath!);
+}
+
+/// Lightweight view of one `incident_reports` row — just what this screen
+/// needs to show a badge and a "Field reports" list. The full report lives on
+/// the Incident Reports screen.
+class _LinkedReport {
+  final String id;
+  final String incidentId;
+  final String sourceType;
+  final String? outcome;
+  final DateTime submittedAt;
+
+  _LinkedReport({
+    required this.id,
+    required this.incidentId,
+    required this.sourceType,
+    required this.outcome,
+    required this.submittedAt,
+  });
+
+  factory _LinkedReport.fromMap(Map<String, dynamic> row) => _LinkedReport(
+        id: row['id'].toString(),
+        incidentId: (row['incident_id'] ?? '').toString(),
+        sourceType: (row['source_type'] ?? '').toString(),
+        outcome: row['outcome'] as String?,
+        submittedAt:
+            DateTime.tryParse(row['submitted_at']?.toString() ?? '')?.toLocal() ??
+                DateTime.now(),
+      );
+}
+
+String _reportSourceLabel(String t) => switch (t) {
+      'task_force' => 'Task Force',
+      'tanod' => 'Tanod',
+      _ => t.isEmpty ? 'Unknown' : t,
+    };
+
+String _reportOutcomeLabel(String? o) => switch (o) {
+      'resolved' => 'Resolved on scene',
+      'escalated' => 'Escalated further',
+      'false_alarm' => 'False alarm',
+      'ongoing' => 'Ongoing — monitoring',
+      'no_action_needed' => 'No action needed',
+      null => 'No outcome yet',
+      _ => o,
+    };
+
+/// A Purok Leader from `profiles` (role = 'Purok Leader'). Location comes
+/// from `live_gps` (keyed by member_id), merged in by `_fetchPurokLeaders`.
+class _PurokLeader {
+  final String id;
+  final String name;
+  final String? phoneNumber;
+  final String? purok;
+  final double? latitude;
+  final double? longitude;
+  double? distanceKm;
+
+  _PurokLeader({
+    required this.id,
+    required this.name,
+    required this.phoneNumber,
+    required this.purok,
+    required this.latitude,
+    required this.longitude,
+  });
+
+  bool get hasLocation => latitude != null && longitude != null;
+
+  factory _PurokLeader.fromMap(
+    Map<String, dynamic> row, {
+    Map<String, dynamic>? gpsRow,
+  }) {
+    final first = (row['first_name'] ?? '').toString().trim();
+    final last = (row['last_name'] ?? '').toString().trim();
+    final name = [first, last].where((s) => s.isNotEmpty).join(' ');
+    return _PurokLeader(
+      id: row['id'].toString(),
+      name: name.isEmpty ? 'Unnamed leader' : name,
+      phoneNumber: row['phone_number'] as String?,
+      purok: row['purok'] as String?,
+      latitude: (gpsRow?['latitude'] as num?)?.toDouble(),
+      longitude: (gpsRow?['longitude'] as num?)?.toDouble(),
+    );
+  }
+}
+
+/// A Task Force responder from `profiles` (role = 'Task Force').
+/// `isDispatched` = already tied to a non-'completed' `task_force_dispatches`
+/// row, so they're locked from selection.
+class _TaskForceMember {
+  final String id;
+  final String name;
+  final String? phoneNumber;
+  final double? latitude;
+  final double? longitude;
+  double? distanceKm;
+  bool isDispatched;
+
+  _TaskForceMember({
+    required this.id,
+    required this.name,
+    required this.phoneNumber,
+    required this.latitude,
+    required this.longitude,
+    this.isDispatched = false,
+  });
+
+  bool get hasLocation => latitude != null && longitude != null;
+
+  factory _TaskForceMember.fromMap(
+    Map<String, dynamic> row, {
+    Map<String, dynamic>? gpsRow,
+  }) {
+    final first = (row['first_name'] ?? '').toString().trim();
+    final last = (row['last_name'] ?? '').toString().trim();
+    final name = [first, last].where((s) => s.isNotEmpty).join(' ');
+    return _TaskForceMember(
+      id: row['id'].toString(),
+      name: name.isEmpty ? 'Unnamed responder' : name,
+      phoneNumber: row['phone_number'] as String?,
+      latitude: (gpsRow?['latitude'] as num?)?.toDouble(),
+      longitude: (gpsRow?['longitude'] as num?)?.toDouble(),
+    );
+  }
+}
+
+/// One row from `taskforce_requests` — a tanod team lead's request for task
+/// force backup on an incident they're already dispatched to.
+class _TaskForceRequest {
+  final String id;
+  final String tanodDispatchId;
+  final String incidentId;
+  final String cameraId;
+  final String requestedBy;
+  final String status;
+  final DateTime createdAt;
+
+  _TaskForceRequest({
+    required this.id,
+    required this.tanodDispatchId,
+    required this.incidentId,
+    required this.cameraId,
+    required this.requestedBy,
+    required this.status,
+    required this.createdAt,
+  });
+
+  factory _TaskForceRequest.fromMap(Map<String, dynamic> row) {
+    return _TaskForceRequest(
+      id: row['id'].toString(),
+      tanodDispatchId: row['tanod_dispatch_id'].toString(),
+      incidentId: row['incident_id'].toString(),
+      cameraId: row['camera_id'].toString(),
+      requestedBy: (row['requested_by'] ?? '').toString(),
+      status: (row['status'] ?? 'pending').toString(),
+      createdAt: DateTime.tryParse(row['created_at']?.toString() ?? '')?.toLocal() ??
+          DateTime.now(),
+    );
+  }
+}
+
+/// Incidents screen — wire in only for the CCTV Manager nav items.
+class IncidentsScreen extends StatefulWidget {
+  final bool isActive;
+  final List<CctvCamera> cameras;
+
+  const IncidentsScreen({
+    super.key,
+    required this.isActive,
+    required this.cameras,
+  });
+
+  @override
+  State<IncidentsScreen> createState() => _IncidentsScreenState();
+}
+
+class _IncidentsScreenState extends State<IncidentsScreen>
+    with TickerProviderStateMixin {
+  Map<String, CctvCamera> get _camerasById =>
+      {for (final c in widget.cameras) c.id: c};
+
+  final SupabaseClient _supabase = Supabase.instance.client;
+
+  // Streams are created ONCE so rebuilds don't re-subscribe.
+  late final Stream<List<Map<String, dynamic>>> _incidentsStream;
+  late final Stream<List<Map<String, dynamic>>> _taskforceRequestsStream;
+  late final Stream<List<Map<String, dynamic>>> _reportsStream;
+
+  // Field reports grouped by incident id (newest first), refreshed from
+  // `_reportsStream` on every build.
+  Map<String, List<_LinkedReport>> _reportsByIncident = {};
+  bool _incidentsLoaded = false;
+
+  // Auto-response now runs on the server (pg_cron -> run_auto_dispatch()).
+  // The config is only read here for the manual Task Force picker's team size.
+  AutoDispatchConfig _autoConfig = AutoDispatchConfig.defaults;
+  StreamSubscription<List<Map<String, dynamic>>>? _autoConfigSub;
+  List<_Incident> _latestIncidents = const [];
+
+  // Incident Details: centered dialog overlay (fade + scale).
+  OverlayEntry? _detailOverlayEntry;
+  late final AnimationController _detailAnimController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 220),
+  );
+
+  // Confirmation dialog overlay, inserted explicitly above the detail overlay
+  // so stacking order is deterministic.
+  OverlayEntry? _confirmOverlayEntry;
+  late final AnimationController _confirmAnimController = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 180),
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    _incidentsStream = _supabase
+        .from('incidents')
+        .stream(primaryKey: ['id'])
+        .order('occurred_at', ascending: false);
+
+    _taskforceRequestsStream = _supabase
+        .from('taskforce_requests')
+        .stream(primaryKey: ['id'])
+        .order('created_at', ascending: false);
+
+    _reportsStream = _supabase.from('incident_reports').stream(primaryKey: ['id']);
+
+    // app_settings is tiny, so the stream is unfiltered; the config row is
+    // picked out client-side.
+    _autoConfigSub = _supabase
+        .from('app_settings')
+        .stream(primaryKey: ['key'])
+        .listen(
+          (rows) => _autoConfig = AutoDispatchConfig.fromSettingsRows(rows),
+          onError: (_) {},
+        );
+
+    IncidentReportLinkService.instance.pending.addListener(_onLinkRequest);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _onLinkRequest());
+  }
+
+  @override
+  void didUpdateWidget(covariant IncidentsScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.isActive && !widget.isActive) {
+      _closeDetailSheet();
+    }
+  }
+
+  @override
+  void dispose() {
+    IncidentReportLinkService.instance.pending.removeListener(_onLinkRequest);
+    _autoConfigSub?.cancel();
+    _detailOverlayEntry?.remove();
+    _detailAnimController.dispose();
+    _confirmOverlayEntry?.remove();
+    _confirmAnimController.dispose();
+    super.dispose();
+  }
+
+  Map<String, List<_LinkedReport>> _groupReports(List<Map<String, dynamic>>? rows) {
+    final map = <String, List<_LinkedReport>>{};
+    for (final row in rows ?? const <Map<String, dynamic>>[]) {
+      final r = _LinkedReport.fromMap(row);
+      if (r.incidentId.isEmpty) continue;
+      (map[r.incidentId] ??= []).add(r);
+    }
+    for (final l in map.values) {
+      l.sort((a, b) => b.submittedAt.compareTo(a.submittedAt));
+    }
+    return map;
+  }
+
+  /// Opens an incident's detail dialog when the Incident Reports screen asks
+  /// for it. Waits until the incidents stream has delivered data; the build
+  /// method retries every frame until then.
+  Future<void> _onLinkRequest() async {
+    final svc = IncidentReportLinkService.instance;
+    final req = svc.pending.value;
+    if (req == null || req.target != LinkTarget.incident || !_incidentsLoaded) return;
+    svc.consume();
+
+    final incident = _latestIncidents.where((i) => i.id == req.id).firstOrNull;
+    if (incident == null) {
+      if (!mounted) return;
+      AppToast.error(context, 'That incident could not be found.');
+      return;
+    }
+    await _closeDetailSheetAsync();
+    if (!mounted) return;
+    _showIncidentDetailSheet(incident, _cameraLabel(_camerasById[incident.cameraId]));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<List<Map<String, dynamic>>>(
+      stream: _incidentsStream,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return Center(
+            child: CircularProgressIndicator(color: AppColors.accentBlue),
+          );
+        }
+        if (snapshot.hasError) {
+          return Center(
+            child: Text(
+              'Error loading incidents: ${snapshot.error}',
+              style: TextStyle(color: AppColors.textMuted(context), fontSize: 13),
+            ),
+          );
+        }
+
+        final allIncidents =
+            (snapshot.data ?? []).map((row) => _Incident.fromMap(row)).toList();
+
+        // Keep the latest snapshot for _onLinkRequest.
+        _latestIncidents = allIncidents;
+        _incidentsLoaded = true;
+        // Retry any pending "open this incident" request from the reports screen.
+        WidgetsBinding.instance.addPostFrameCallback((_) => _onLinkRequest());
+
+        return StreamBuilder<List<Map<String, dynamic>>>(
+          stream: _reportsStream,
+          builder: (context, reportSnap) {
+            _reportsByIncident = _groupReports(reportSnap.data);
+            // Keep an open detail dialog fresh if a report arrives while open.
+            WidgetsBinding.instance
+                .addPostFrameCallback((_) => _detailOverlayEntry?.markNeedsBuild());
+
+            return _IncidentsView(
+              incidents: allIncidents,
+              camerasById: _camerasById,
+              reportsByIncident: _reportsByIncident,
+              requestsStream: _taskforceRequestsStream,
+              onOpenIncident: (incident, cameraName) =>
+                  _showIncidentDetailSheet(incident, cameraName),
+              onOpenBackups: () => _showBackupRequestsPanel(allIncidents),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _announceIfFire(_Incident? incident) async {
+    if (incident == null) return;
+    if (!incident.alertType.toLowerCase().contains('fire')) return;
+
+    final ok = await PaAudioService.instance.play();
+    if (!mounted) return;
+    if (ok) {
+      AppToast.info(context, 'Fire announcement playing on PA');
+    } else {
+      AppToast.error(context,
+          'No fire announcement MP3 set. Pick one on the PA Speakers screen.');
+    }
+  }
+  /// Opens the right-docked Backup Requests drawer.
+  Future<void> _showBackupRequestsPanel(List<_Incident> allIncidents) async {
+    final incidentsById = {for (final i in allIncidents) i.id: i};
+
+    await _showPickerSheet<void>(
+      (close) => _BackupDrawer(
+        requestsStream: _taskforceRequestsStream,
+        incidentsById: incidentsById,
+        camerasById: _camerasById,
+        onClose: () => close(),
+        onDispatch: (request) => _handleDispatchTaskForceForRequest(request),
+      ),
+      width: 440,
+    );
+  }
+
+  // --- OVERLAYS (incident details + dispatch pickers) ---
+
+  // Deferred with Future.delayed(Duration.zero): inserting an interactive
+  // overlay synchronously from a tap can land inside the mouse-tracker
+  // device-update pass on desktop/web and trip '!_debugDuringDeviceUpdate'.
+  void _showIncidentDetailSheet(_Incident incident, String cameraName) {
+    Future.delayed(Duration.zero, () {
+      if (!mounted) return;
+      _detailOverlayEntry = OverlayEntry(
+        builder: (_) => _buildDetailSheetOverlay(incident, cameraName),
+      );
+      Overlay.of(context, rootOverlay: true).insert(_detailOverlayEntry!);
+      _detailAnimController.forward(from: 0);
+    });
+  }
+
+  void _closeDetailSheet() {
+    if (_detailOverlayEntry == null) return;
+    _detailAnimController.reverse().then((_) {
+      _detailOverlayEntry?.remove();
+      _detailOverlayEntry = null;
+    });
+  }
+
+  Future<void> _closeDetailSheetAsync() async {
+    if (_detailOverlayEntry == null) return;
+    await _detailAnimController.reverse();
+    _detailOverlayEntry?.remove();
+    _detailOverlayEntry = null;
+  }
+
+  /// Pushes a right-docked side panel. Each sheet owns its OWN animation
+  /// controller and overlay entry, so panels can stack (e.g. the Task Force
+  /// picker opening on top of the Backup drawer) without orphaning each other.
+  Future<T?> _showPickerSheet<T>(
+    Widget Function(void Function([T? result]) close) contentBuilder, {
+    double width = 980,
+  }) {
+    final completer = Completer<T?>();
+    var completed = false;
+
+    final controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 260),
+    );
+    final slide = Tween<Offset>(begin: const Offset(1, 0), end: Offset.zero)
+        .animate(CurvedAnimation(
+      parent: controller,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    ));
+
+    late final OverlayEntry entry;
+
+    void close([T? result]) {
+      if (completed) return;
+      completed = true;
+      controller.reverse().then((_) {
+        entry.remove();
+        WidgetsBinding.instance.addPostFrameCallback((_) => controller.dispose());
+        completer.complete(result);
+      });
+    }
+
+    entry = OverlayEntry(
+      builder: (_) => _buildSidePanelOverlay(
+        animController: controller,
+        slide: slide,
+        onScrimTap: () => close(),
+        width: width,
+        panel: contentBuilder(close),
+      ),
+    );
+
+    Future.delayed(Duration.zero, () {
+      if (!mounted) {
+        controller.dispose();
+        if (!completer.isCompleted) completer.complete(null);
+        return;
+      }
+      Overlay.of(context, rootOverlay: true).insert(entry);
+      controller.forward(from: 0);
+    });
+    return completer.future;
+  }
+
+  /// Side-panel chrome: dimmed scrim + fixed-width card docked right,
+  /// full height, slides in/out.
+  Widget _buildSidePanelOverlay({
+    required AnimationController animController,
+    required Animation<Offset> slide,
+    required VoidCallback onScrimTap,
+    required double width,
+    required Widget panel,
+  }) {
+    final screenSize = MediaQuery.of(context).size;
+    final panelWidth = width > screenSize.width - 24 ? screenSize.width - 24 : width;
+    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
+
+    return Positioned.fill(
+      child: Stack(
+        children: [
+          AnimatedBuilder(
+            animation: animController,
+            builder: (context, _) => Positioned.fill(
+              child: GestureDetector(
+                onTap: onScrimTap,
+                child: Container(
+                  color: Colors.black.withOpacity(0.45 * animController.value),
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            top: 0,
+            right: 0,
+            bottom: bottomInset,
+            width: panelWidth,
+            child: SlideTransition(
+              position: slide,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(16),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.5),
+                        blurRadius: 24,
+                        offset: const Offset(-4, 0),
+                      ),
+                    ],
+                  ),
+                  // Root-overlay insert => needs an explicit Material. The
+                  // empty onTap stops taps falling through to the scrim.
+                  child: Material(
+                    color: Colors.transparent,
+                    child: GestureDetector(
+                      onTap: () {},
+                      child: SafeArea(child: panel),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Centered modal-dialog chrome for Incident Details (fade + scale).
+  /// Shrinks to fit content up to `maxHeight` (IntrinsicHeight — so the panel
+  /// must not contain scrollables).
+  Widget _buildCenteredDialogOverlay({
+    required AnimationController animController,
+    required VoidCallback onScrimTap,
+    required double width,
+    required double maxHeight,
+    required Widget panel,
+  }) {
+    final screenSize = MediaQuery.of(context).size;
+    final panelWidth = width > screenSize.width - 48 ? screenSize.width - 48 : width;
+    final panelMaxHeight =
+        maxHeight > screenSize.height - 48 ? screenSize.height - 48 : maxHeight;
+
+    return Positioned.fill(
+      child: AnimatedBuilder(
+        animation: animController,
+        builder: (context, _) {
+          final t = Curves.easeOutCubic.transform(animController.value).clamp(0.0, 1.0);
+          return Stack(
+            children: [
+              Positioned.fill(
+                child: GestureDetector(
+                  onTap: onScrimTap,
+                  child: Container(color: Colors.black.withOpacity(0.55 * t)),
+                ),
+              ),
+              Center(
+                child: Opacity(
+                  opacity: t,
+                  child: Transform.scale(
+                    scale: 0.94 + (0.06 * t),
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        minWidth: panelWidth,
+                        maxWidth: panelWidth,
+                        maxHeight: panelMaxHeight,
+                      ),
+                      child: IntrinsicHeight(
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(20),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.5),
+                                blurRadius: 40,
+                                offset: const Offset(0, 16),
+                              ),
+                            ],
+                          ),
+                          child: Material(
+                            color: Colors.transparent,
+                            child: GestureDetector(
+                              onTap: () {},
+                              child: panel,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _updateIncidentStatus(String incidentId, String status) async {
+    try {
+      await _supabase.from('incidents').update({'status': status}).eq('id', incidentId);
+    } catch (e) {
+      if (!mounted) return;
+      AppToast.error(context, 'Failed to update incident: $e');
+    }
+  }
+
+  /// Confirmation dialog on its own OverlayEntry, pinned above the detail
+  /// overlay (if any).
+  Future<bool> _showActionConfirmDialog({
+    required String title,
+    required String message,
+    required String confirmLabel,
+    required Color confirmColor,
+    required IconData icon,
+  }) async {
+    final completer = Completer<bool>();
+    var completed = false;
+
+    void respond(bool result) {
+      if (completed) return;
+      completed = true;
+      _confirmAnimController.reverse().then((_) {
+        _confirmOverlayEntry?.remove();
+        _confirmOverlayEntry = null;
+        if (!completer.isCompleted) completer.complete(result);
+      });
+    }
+
+    _confirmOverlayEntry = OverlayEntry(
+      builder: (_) => _buildConfirmDialogOverlay(
+        title: title,
+        message: message,
+        confirmLabel: confirmLabel,
+        confirmColor: confirmColor,
+        icon: icon,
+        onScrimTap: () => respond(false),
+        onCancel: () => respond(false),
+        onConfirm: () => respond(true),
+      ),
+    );
+
+    Future.delayed(Duration.zero, () {
+      if (!mounted) return;
+      Overlay.of(context, rootOverlay: true).insert(
+        _confirmOverlayEntry!,
+        above: _detailOverlayEntry,
+      );
+      _confirmAnimController.forward(from: 0);
+    });
+
+    return completer.future;
+  }
+
+  Widget _buildConfirmDialogOverlay({
+    required String title,
+    required String message,
+    required String confirmLabel,
+    required Color confirmColor,
+    required IconData icon,
+    required VoidCallback onScrimTap,
+    required VoidCallback onCancel,
+    required VoidCallback onConfirm,
+  }) {
+    return Positioned.fill(
+      child: AnimatedBuilder(
+        animation: _confirmAnimController,
+        builder: (context, _) {
+          final t =
+              Curves.easeOutCubic.transform(_confirmAnimController.value).clamp(0.0, 1.0);
+          return Stack(
+            children: [
+              Positioned.fill(
+                child: GestureDetector(
+                  onTap: onScrimTap,
+                  child: Container(color: Colors.black.withOpacity(0.55 * t)),
+                ),
+              ),
+              Center(
+                child: Opacity(
+                  opacity: t,
+                  child: Transform.scale(
+                    scale: 0.94 + (0.06 * t),
+                    child: Material(
+                      color: Colors.transparent,
+                      child: GestureDetector(
+                        onTap: () {},
+                        child: Container(
+                          width: 360,
+                          padding: const EdgeInsets.all(22),
+                          decoration: BoxDecoration(
+                            color: AppColors.card(context),
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(color: AppColors.border(context)),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.5),
+                                blurRadius: 40,
+                                offset: const Offset(0, 16),
+                              ),
+                            ],
+                          ),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.all(10),
+                                decoration: BoxDecoration(
+                                  color: confirmColor.withOpacity(0.14),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Icon(icon, color: confirmColor, size: 20),
+                              ),
+                              const SizedBox(height: 14),
+                              Text(
+                                title,
+                                style: TextStyle(
+                                    color: AppColors.textMain(context),
+                                    fontSize: 17,
+                                    fontWeight: FontWeight.w800),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                message,
+                                style: TextStyle(
+                                    color: AppColors.textMuted(context),
+                                    fontSize: 13,
+                                    height: 1.45),
+                              ),
+                              const SizedBox(height: 22),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: OutlinedButton(
+                                      onPressed: onCancel,
+                                      style: OutlinedButton.styleFrom(
+                                        foregroundColor: AppColors.textMain(context),
+                                        side: BorderSide(color: AppColors.border(context)),
+                                        padding: const EdgeInsets.symmetric(vertical: 14),
+                                        shape: RoundedRectangleBorder(
+                                            borderRadius: BorderRadius.circular(10)),
+                                      ),
+                                      child: const Text('CANCEL',
+                                          style: TextStyle(
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w800,
+                                              letterSpacing: 0.5)),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: ElevatedButton(
+                                      onPressed: onConfirm,
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: confirmColor,
+                                        foregroundColor: Colors.white,
+                                        elevation: 0,
+                                        padding: const EdgeInsets.symmetric(vertical: 14),
+                                        shape: RoundedRectangleBorder(
+                                            borderRadius: BorderRadius.circular(10)),
+                                      ),
+                                      child: Text(confirmLabel,
+                                          style: const TextStyle(
+                                              fontSize: 12,
+                                              fontWeight: FontWeight.w800,
+                                              letterSpacing: 0.5)),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _handleFalseDetection(_Incident incident) async {
+    final confirmed = await _showActionConfirmDialog(
+      title: 'Mark as false detection?',
+      message: 'This will flag this incident as a false detection. Continue?',
+      confirmLabel: 'CONFIRM',
+      confirmColor: AppColors.accentRed,
+      icon: Icons.block,
+    );
+    if (!confirmed) return;
+
+    // Claim first: only succeeds if nobody (including the server) handled it.
+    if (!await _claimForManual(incident.id, 'false_detection')) {
+      if (!mounted) return;
+      _closeDetailSheet();
+      AppToast.info(context, 'This incident was already handled.');
+      return;
+    }
+
+    if (!mounted) return;
+    _closeDetailSheet();
+    AppToast.success(context, 'Marked as false detection');
+  }
+
+  // --- DATA / DISPATCH ---
+
+  /// Haversine distance in km.
+  double _distanceKm(double lat1, double lon1, double lat2, double lon2) {
+    const earthRadiusKm = 6371.0;
+    final dLat = _degToRad(lat2 - lat1);
+    final dLon = _degToRad(lon2 - lon1);
+    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(_degToRad(lat1)) *
+            math.cos(_degToRad(lat2)) *
+            math.sin(dLon / 2) *
+            math.sin(dLon / 2);
+    final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+    return earthRadiusKm * c;
+  }
+
+  double _degToRad(double deg) => deg * (math.pi / 180);
+
+  /// All `live_gps` rows keyed by `member_id` (the ONLY source of location
+  /// data). If it holds history rows, add an `.order('updated_at')` so the
+  /// latest row wins.
+  Future<Map<String, Map<String, dynamic>>> _fetchLiveGpsByMemberId() async {
+    final rows = await _supabase.from('live_gps').select();
+    return {
+      for (final r in (rows as List))
+        (r as Map<String, dynamic>)['member_id'].toString(): r,
+    };
+  }
+
+  /// Member ids tied to a NOT-'completed' `task_force_dispatches` row.
+  Future<Set<String>> _fetchActiveDispatchedMemberIds() async {
+    final rows = await _supabase
+        .from('task_force_dispatches')
+        .select('member_ids, status')
+        .neq('status', 'completed');
+
+    final ids = <String>{};
+    for (final r in (rows as List)) {
+      final row = r as Map<String, dynamic>;
+      final memberIds = (row['member_ids'] as List?) ?? const [];
+      ids.addAll(memberIds.map((e) => e.toString()));
+    }
+    return ids;
+  }
+
+  Future<List<_PurokLeader>> _fetchPurokLeaders() async {
+    // Roles are stored display-cased ("Purok Leader").
+    final gpsFuture = _fetchLiveGpsByMemberId();
+    final profileRows =
+        await _supabase.from('profiles').select().eq('role', 'Purok Leader');
+    final gpsByMember = await gpsFuture;
+
+    return (profileRows as List).map((r) {
+      final row = r as Map<String, dynamic>;
+      return _PurokLeader.fromMap(row, gpsRow: gpsByMember[row['id'].toString()]);
+    }).toList();
+  }
+
+  Future<List<_TaskForceMember>> _fetchTaskForceMembers() async {
+    final gpsFuture = _fetchLiveGpsByMemberId();
+    final dispatchedFuture = _fetchActiveDispatchedMemberIds();
+    final profileRows =
+        await _supabase.from('profiles').select().eq('role', 'Task Force');
+    final gpsByMember = await gpsFuture;
+    final dispatchedIds = await dispatchedFuture;
+
+    return (profileRows as List).map((r) {
+      final row = r as Map<String, dynamic>;
+      final member =
+          _TaskForceMember.fromMap(row, gpsRow: gpsByMember[row['id'].toString()]);
+      member.isDispatched = dispatchedIds.contains(row['id'].toString());
+      return member;
+    }).toList();
+  }
+
+  /// Distance-annotates and sorts Purok Leaders, nearest first (alphabetical
+  /// if no locations). Sorts in place and returns the same list.
+  List<_PurokLeader> _rankPurokLeaders(
+      List<_PurokLeader> leaders, CctvCamera? camera) {
+    final cameraLat = camera?.latitude;
+    final cameraLng = camera?.longitude;
+    if (cameraLat != null && cameraLng != null) {
+      for (final leader in leaders) {
+        if (leader.hasLocation) {
+          leader.distanceKm =
+              _distanceKm(cameraLat, cameraLng, leader.latitude!, leader.longitude!);
+        }
+      }
+    }
+    final anyDistance = leaders.any((l) => l.distanceKm != null);
+    leaders.sort((a, b) {
+      if (anyDistance) {
+        if (a.distanceKm == null && b.distanceKm == null) return 0;
+        if (a.distanceKm == null) return 1;
+        if (b.distanceKm == null) return -1;
+        return a.distanceKm!.compareTo(b.distanceKm!);
+      }
+      return a.name.compareTo(b.name);
+    });
+    return leaders;
+  }
+
+  /// Distance-annotates and sorts Task Force members: on-duty members last,
+  /// then nearest first (alphabetical if no locations). Sorts in place.
+  List<_TaskForceMember> _rankTaskForce(
+      List<_TaskForceMember> members, CctvCamera? camera) {
+    final cameraLat = camera?.latitude;
+    final cameraLng = camera?.longitude;
+    if (cameraLat != null && cameraLng != null) {
+      for (final m in members) {
+        if (m.hasLocation) {
+          m.distanceKm = _distanceKm(cameraLat, cameraLng, m.latitude!, m.longitude!);
+        }
+      }
+    }
+    final anyDistance = members.any((m) => m.distanceKm != null);
+    members.sort((a, b) {
+      if (a.isDispatched != b.isDispatched) return a.isDispatched ? 1 : -1;
+      if (anyDistance) {
+        if (a.distanceKm == null && b.distanceKm == null) return 0;
+        if (a.distanceKm == null) return 1;
+        if (b.distanceKm == null) return -1;
+        return a.distanceKm!.compareTo(b.distanceKm!);
+      }
+      return a.name.compareTo(b.name);
+    });
+    return members;
+  }
+
+  /// Fetches task force members, computes distance from the camera, and sorts:
+  /// on-duty members last, then nearest first (alphabetical if no locations).
+  /// Returns null (after showing a toast) if loading failed or none exist.
+  Future<List<_TaskForceMember>?> _loadRankedTaskForce(CctvCamera? camera) async {
+    List<_TaskForceMember> members;
+    try {
+      members = await _fetchTaskForceMembers();
+    } catch (e) {
+      if (!mounted) return null;
+      AppToast.error(context, 'Failed to load task force members: $e');
+      return null;
+    }
+
+    if (members.isEmpty) {
+      if (!mounted) return null;
+      AppToast.info(context, 'No task force members found in profiles.');
+      return null;
+    }
+
+    return _rankTaskForce(members, camera);
+  }
+
+  /// Send a response request to a Purok Leader. The detail sheet is closed
+  /// first and reopened on every exit path except a successful send.
+  Future<void> _handleSendRequestToPurokLeader(
+      _Incident incident, CctvCamera? camera) async {
+    final cameraName = _cameraLabel(camera);
+    await _closeDetailSheetAsync();
+
+    List<_PurokLeader> leaders;
+    try {
+      leaders = await _fetchPurokLeaders();
+    } catch (e) {
+      if (!mounted) return;
+      AppToast.error(context, 'Failed to load Purok Leaders: $e');
+      _showIncidentDetailSheet(incident, cameraName);
+      return;
+    }
+
+    _rankPurokLeaders(leaders, camera);
+
+    if (leaders.isEmpty) {
+      if (!mounted) return;
+      AppToast.info(context, 'No Purok Leaders found in profiles.');
+      _showIncidentDetailSheet(incident, cameraName);
+      return;
+    }
+
+    if (!mounted) return;
+    final selected = await _showPickerSheet<_PurokLeader>(
+      (close) => _PurokLeaderPickerSheet(
+        leaders: leaders,
+        camera: camera,
+        onClose: close,
+      ),
+    );
+
+    if (selected == null) {
+      if (!mounted) return;
+      _showIncidentDetailSheet(incident, cameraName);
+      return;
+    }
+
+    // Claim the incident first. If the server (or another admin) already
+    // handled it while the picker was open, stop here.
+    if (!await _claimForManual(incident.id, 'leader_notified')) {
+      if (!mounted) return;
+      AppToast.info(context, 'This incident was already handled.');
+      return;
+    }
+
+    try {
+      await _supabase.from('dispatch_requests').insert({
+        'incident_id': incident.id,
+        'leader_id': selected.id,
+        'camera_id': incident.cameraId,
+        'distance_km': selected.distanceKm,
+        'status': 'pending',
+        'requested_by': _supabase.auth.currentUser?.id,
+      });
+    } catch (e) {
+      // The insert failed, so release the claim to let someone retry.
+      await _releaseIncident(incident.id);
+      if (!mounted) return;
+      AppToast.error(context, 'Failed to send request: $e');
+      _showIncidentDetailSheet(incident, cameraName);
+      return;
+    }
+
+    if (!mounted) return;
+    unawaited(_announceIfFire(incident));
+    AppToast.success(context, 'Response request sent to ${selected.name}');
+  }
+
+  /// Direct escalation from an incident's detail sheet — bypasses the Purok
+  /// Leader; command center picks who goes and who leads.
+  Future<void> _handleDispatchTaskForce(_Incident incident, CctvCamera? camera) async {
+    final cameraName = _cameraLabel(camera);
+    await _closeDetailSheetAsync();
+
+    final members = await _loadRankedTaskForce(camera);
+    if (members == null) {
+      if (!mounted) return;
+      _showIncidentDetailSheet(incident, cameraName);
+      return;
+    }
+
+    if (!mounted) return;
+    final result = await _showPickerSheet<_TaskForceDispatchSelection>(
+      (close) => _TaskForceDispatchSheet(
+        members: members,
+        camera: camera,
+        defaultTeamSize: _autoConfig.taskForceTeamSize,
+        onClose: close,
+      ),
+    );
+
+    if (result == null || result.members.isEmpty) {
+      if (!mounted) return;
+      _showIncidentDetailSheet(incident, cameraName);
+      return;
+    }
+
+    // Claim the incident first. If the server (or another admin) already
+    // handled it while the picker was open, stop here.
+    if (!await _claimForManual(incident.id, 'task_force_dispatched')) {
+      if (!mounted) return;
+      AppToast.info(context, 'This incident was already handled.');
+      return;
+    }
+
+    try {
+      await _supabase.from('task_force_dispatches').insert({
+        'incident_id': incident.id,
+        'camera_id': incident.cameraId,
+        'dispatched_by': _supabase.auth.currentUser?.id,
+        'team_lead_id': result.leadId,
+        'member_ids': result.members.map((m) => m.id).toList(),
+        'status': 'dispatched',
+      });
+    } catch (e) {
+      // The insert failed, so release the claim to let someone retry.
+      await _releaseIncident(incident.id);
+      if (!mounted) return;
+      AppToast.error(context, 'Failed to dispatch task force: $e');
+      _showIncidentDetailSheet(incident, cameraName);
+      return;
+    }
+
+    if (!mounted) return;
+    unawaited(_announceIfFire(incident));
+    final leadName = result.members.firstWhere((m) => m.id == result.leadId).name;
+    AppToast.success(context,
+        'Task force dispatched (${result.members.length}) — lead: $leadName');
+  }
+
+  Future<bool> _claimForManual(String incidentId, String status) async {
+    try {
+      // Normal case: status is NULL.
+      var rows = await _supabase
+          .from('incidents')
+          .update({'status': status})
+          .eq('id', incidentId)
+          .isFilter('status', null)
+          .select('id');
+      if ((rows as List).isNotEmpty) return true;
+
+      // Fallback: status is an empty string.
+      rows = await _supabase
+          .from('incidents')
+          .update({'status': status})
+          .eq('id', incidentId)
+          .eq('status', '')
+          .select('id');
+      return (rows as List).isNotEmpty;
+    } catch (e) {
+      debugPrint('Manual claim failed for $incidentId: $e');
+      return false;
+    }
+  }
+
+  Future<void> _releaseIncident(String incidentId) async {
+    try {
+      await _supabase.from('incidents').update({'status': null}).eq('id', incidentId);
+    } catch (e) {
+      debugPrint('Failed to release incident $incidentId: $e');
+    }
+  }
+
+  /// Dispatch triggered from a card in the Backup drawer. Tags the new
+  /// `task_force_dispatches` row with the tanod request/dispatch ids and flips
+  /// `escalated = true` on the ORIGINAL tanod dispatch (TanodHomeScreen
+  /// listens for it). The picker stacks on top of the drawer; closing it
+  /// leaves the drawer exactly where it was.
+  Future<void> _handleDispatchTaskForceForRequest(_TaskForceRequest request) async {
+    final camera = _camerasById[request.cameraId];
+    final cameraName = _cameraLabel(camera);
+
+    final members = await _loadRankedTaskForce(camera);
+    if (members == null) return;
+
+    if (!mounted) return;
+    final result = await _showPickerSheet<_TaskForceDispatchSelection>(
+      (close) => _TaskForceDispatchSheet(
+        members: members,
+        camera: camera,
+        defaultTeamSize: _autoConfig.taskForceTeamSize,
+        onClose: close,
+      ),
+    );
+    if (result == null || result.members.isEmpty) return;
+
+    String newDispatchId;
+    try {
+      final inserted = await _supabase.from('task_force_dispatches').insert({
+        'incident_id': request.incidentId,
+        'camera_id': request.cameraId,
+        'dispatched_by': _supabase.auth.currentUser?.id,
+        'team_lead_id': result.leadId,
+        'member_ids': result.members.map((m) => m.id).toList(),
+        'status': 'dispatched',
+        'source_tanod_dispatch_id': request.tanodDispatchId,
+        'taskforce_request_id': request.id,
+      }).select('id').single();
+      newDispatchId = inserted['id'].toString();
+    } catch (e) {
+      if (!mounted) return;
+      AppToast.error(context, 'Failed to dispatch task force: $e');
+      return;
+    }
+
+    try {
+      await _supabase.from('taskforce_requests').update({
+        'status': 'dispatched',
+        'resolved_at': DateTime.now().toUtc().toIso8601String(),
+      }).eq('id', request.id);
+
+      await _supabase.from('tanod_dispatches').update({
+        'escalated': true,
+        'escalated_task_force_dispatch_id': newDispatchId,
+      }).eq('id', request.tanodDispatchId);
+
+      await _updateIncidentStatus(request.incidentId, 'task_force_dispatched');
+    } catch (e) {
+      if (!mounted) return;
+      AppToast.error(context,
+          'Task force dispatched, but a follow-up update failed: $e');
+      return;
+    }
+
+    if (!mounted) return;
+        unawaited(_announceIfFire(
+        _latestIncidents.where((i) => i.id == request.incidentId).firstOrNull));
+    final leadName = result.members.firstWhere((m) => m.id == result.leadId).name;
+    AppToast.success(context,
+        'Task force dispatched to back up tanod at $cameraName — lead: $leadName');
+  }
+
+  Widget _buildDetailSheetOverlay(_Incident incident, String cameraName) {
+    final camera = _camerasById[incident.cameraId];
+    return _buildCenteredDialogOverlay(
+      animController: _detailAnimController,
+      onScrimTap: _closeDetailSheet,
+      width: 980,
+      maxHeight: 700, // was 640; the field reports card adds a little height
+      panel: _IncidentDetailSheet(
+        incident: incident,
+        cameraName: cameraName,
+        reports: _reportsByIncident[incident.id] ?? const [],
+        onOpenReport: (reportId) async {
+          await _closeDetailSheetAsync();
+          IncidentReportLinkService.instance.openReport(reportId);
+        },
+        onClose: _closeDetailSheet,
+        onFalseDetection: () => _handleFalseDetection(incident),
+        onSendRequest: () => _handleSendRequestToPurokLeader(incident, camera),
+        onDispatchTaskForce: () => _handleDispatchTaskForce(incident, camera),
+      ),
+    );
+  }
+}
+
+const Color _kAmber = Color(0xFFF59E0B);
+
+enum _StatusFilter { all, needsAction, handled, falseDetection }
+
+enum _IncidentSort { newest, oldest, severity }
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+/// What users see for a camera everywhere on this screen: its physical
+/// LOCATION (cameras.location). Falls back to the camera name if no location
+/// is set, so nothing is ever blank.
+String _cameraLabel(CctvCamera? camera) {
+  final location = camera?.location?.trim();
+  if (location != null && location.isNotEmpty) return location;
+  final name = camera?.name;
+  if (name != null && name.trim().isNotEmpty) return name;
+  return 'Unknown location';
+}
+
+String _levelName(AlertLevel level) {
+  final name = level.toString().split('.').last;
+  if (name.isEmpty) return name;
+  return name[0].toUpperCase() + name.substring(1);
+}
+
+/// Lower = more severe. Name-based so it doesn't depend on enum order; adjust
+/// the names if your AlertLevel values are called something else.
+int _severityRank(AlertLevel level) {
+  switch (_levelName(level).toLowerCase()) {
+    case 'critical':
+      return 0;
+    case 'high':
+    case 'priority':
+      return 1;
+    case 'medium':
+    case 'warning':
+      return 2;
+    default:
+      return 3;
+  }
+}
+
+String _relativeTime(DateTime dt) {
+  final diff = DateTime.now().difference(dt);
+  if (diff.inSeconds < 60) return 'Just now';
+  if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+  if (diff.inHours < 24) return '${diff.inHours}h ago';
+  if (diff.inDays < 7) return '${diff.inDays}d ago';
+  return DateFormat('MMM d').format(dt);
+}
+
+String _waitLabel(Duration d) {
+  if (d.inMinutes < 1) return '<1 min';
+  if (d.inMinutes < 60) return '${d.inMinutes} min';
+  final h = d.inHours;
+  final m = d.inMinutes % 60;
+  return m == 0 ? '$h hr' : '$h hr $m min';
+}
+
+class _StatusInfo {
+  final String label;
+  final IconData icon;
+  final Color color;
+  const _StatusInfo(this.label, this.icon, this.color);
+}
+
+_StatusInfo _statusInfoFor(BuildContext context, String? status) {
+  switch ((status ?? '').trim()) {
+    case '':
+      return const _StatusInfo(
+          'Needs action', Icons.notifications_active_outlined, _kAmber);
+    case 'false_detection':
+      return _StatusInfo(
+          'False detection', Icons.block, AppColors.textMuted(context));
+    case 'leader_notified':
+      return _StatusInfo('Leader notified', Icons.person_pin_circle_outlined,
+          AppColors.accentBlue);
+    case 'tanod_dispatched':
+      return _StatusInfo(
+          'Tanod responding', Icons.groups_outlined, AppColors.accentGreen);
+    case 'task_force_dispatched':
+      return _StatusInfo(
+          'Task force sent', Icons.security, AppColors.accentRed);
+    default:
+      return _StatusInfo(
+          'Handled', Icons.check_circle_outline, AppColors.textMuted(context));
+  }
+}
+
+class _LevelPill extends StatelessWidget {
+  final String text;
+  final Color color;
+  const _LevelPill({required this.text, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration:
+          BoxDecoration(color: color, borderRadius: BorderRadius.circular(4)),
+      child: Text(
+        text.toUpperCase(),
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(
+            color: Colors.black87,
+            fontSize: 9,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 0.2),
+      ),
+    );
+  }
+}
+
+class _LevelDot extends StatelessWidget {
+  final Color color;
+  final double size;
+  const _LevelDot({required this.color, this.size = 8});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+    );
+  }
+}
+
+/// Plain "• Status" text. No pill, no border, no fill.
+class _StatusText extends StatelessWidget {
+  final _StatusInfo info;
+  const _StatusText({required this.info});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _LevelDot(color: info.color, size: 6),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            info.label,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: AppColors.textMain(context),
+              fontSize: 12,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main body: stat cards + toolbar + grid/list + footer
+// ---------------------------------------------------------------------------
+
+/// Owns ALL view state (search, filters, sort, view mode, page) so the
+/// realtime incidents stream rebuilding above it never resets the user's
+/// filters.
+class _IncidentsView extends StatefulWidget {
+  final List<_Incident> incidents;
+  final Map<String, CctvCamera> camerasById;
+  final Map<String, List<_LinkedReport>> reportsByIncident;
+  final Stream<List<Map<String, dynamic>>> requestsStream;
+  final void Function(_Incident incident, String cameraName) onOpenIncident;
+  final VoidCallback onOpenBackups;
+
+  const _IncidentsView({
+    required this.incidents,
+    required this.camerasById,
+    required this.reportsByIncident,
+    required this.requestsStream,
+    required this.onOpenIncident,
+    required this.onOpenBackups,
+  });
+
+  @override
+  State<_IncidentsView> createState() => _IncidentsViewState();
+}
+
+class _IncidentsViewState extends State<_IncidentsView> {
+  static const int _perPage = 24;
+
+  final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocusNode = FocusNode();
+  String _query = '';
+  AlertLevel? _level;
+  _StatusFilter _status = _StatusFilter.all;
+  _IncidentSort _sort = _IncidentSort.newest;
+  bool _gridView = true;
+  int _page = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    // Rebuild on focus change so the search icon can turn blue.
+    _searchFocusNode.addListener(() => setState(() {}));
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    _searchFocusNode.dispose();
+    super.dispose();
+  }
+
+  bool get _hasFilters =>
+      _query.trim().isNotEmpty || _level != null || _status != _StatusFilter.all;
+
+  void _resetFilters() => setState(() {
+        _searchController.clear();
+        _query = '';
+        _level = null;
+        _status = _StatusFilter.all;
+        _page = 0;
+      });
+
+  bool _needsAction(_Incident i) => (i.status ?? '').trim().isEmpty;
+
+  bool _matchesStatus(_Incident i) {
+    switch (_status) {
+      case _StatusFilter.all:
+        return true;
+      case _StatusFilter.needsAction:
+        return _needsAction(i);
+      case _StatusFilter.handled:
+        return !_needsAction(i) && i.status != 'false_detection';
+      case _StatusFilter.falseDetection:
+        return i.status == 'false_detection';
+    }
+  }
+
+  /// The camera's LOCATION (falls back to its name) — see `_cameraLabel`.
+  String _cameraName(_Incident i) => _cameraLabel(widget.camerasById[i.cameraId]);
+
+  @override
+  Widget build(BuildContext context) {
+    final all = widget.incidents;
+    final q = _query.trim().toLowerCase();
+
+    final filtered = all.where((i) {
+      if (_level != null && i.alertLevel != _level) return false;
+      if (!_matchesStatus(i)) return false;
+      if (q.isEmpty) return true;
+      return _cameraName(i).toLowerCase().contains(q) ||
+          (widget.camerasById[i.cameraId]?.name ?? '').toLowerCase().contains(q) ||
+          i.alertType.toLowerCase().contains(q) ||
+          _levelName(i.alertLevel).toLowerCase().contains(q);
+    }).toList();
+
+    switch (_sort) {
+      case _IncidentSort.newest:
+        filtered.sort((a, b) => b.occurredAt.compareTo(a.occurredAt));
+        break;
+      case _IncidentSort.oldest:
+        filtered.sort((a, b) => a.occurredAt.compareTo(b.occurredAt));
+        break;
+      case _IncidentSort.severity:
+        filtered.sort((a, b) {
+          final r = _severityRank(a.alertLevel)
+              .compareTo(_severityRank(b.alertLevel));
+          return r != 0 ? r : b.occurredAt.compareTo(a.occurredAt);
+        });
+        break;
+    }
+
+    final totalPages = (filtered.length / _perPage).ceil();
+    final safePage = totalPages == 0
+        ? 0
+        : (_page >= totalPages ? totalPages - 1 : _page);
+    if (safePage != _page) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() => _page = safePage);
+      });
+    }
+    final pageStart = safePage * _perPage;
+    final pageEnd = (pageStart + _perPage).clamp(0, filtered.length);
+    final pageItems =
+        filtered.isEmpty ? <_Incident>[] : filtered.sublist(pageStart, pageEnd);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildHeader(all),
+        const SizedBox(height: 18),
+        _buildStatRow(all),
+        const SizedBox(height: 18),
+        _buildToolbarRow(all, filtered.length),
+        const SizedBox(height: 14),
+        Expanded(
+          child: Container(
+            decoration: BoxDecoration(
+              color: AppColors.card(context),
+              borderRadius: BorderRadius.circular(16), // matches Users / Logs
+              border: Border.all(color: AppColors.border(context)),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (!_gridView && pageItems.isNotEmpty) _buildListHeader(),
+                Expanded(
+                  child: pageItems.isEmpty
+                      ? _buildEmptyState(all.isEmpty)
+                      : (_gridView
+                          ? _buildGrid(pageItems)
+                          : _buildList(pageItems)),
+                ),
+                if (filtered.isNotEmpty) ...[
+                  Divider(
+                      color: AppColors.border(context), height: 1, thickness: 1),
+                  Container(
+                    width: double.infinity,
+                    color: AppColors.sunken(context),
+                    padding:
+                        const EdgeInsets.symmetric(vertical: 10, horizontal: 20),
+                    child: Row(
+                      children: [
+                        Text(
+                          'Showing ${pageStart + 1}–$pageEnd of ${filtered.length}',
+                          style: TextStyle(
+                              color: AppColors.textMuted(context),
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w500),
+                        ),
+                        const Spacer(),
+                        _buildPagePicker(
+                          currentPage: safePage,
+                          totalPages: totalPages == 0 ? 1 : totalPages,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ----- Page header (matches Users' title + subtitle) -----
+
+  Widget _buildHeader(List<_Incident> all) {
+    final needs = all.where(_needsAction).length;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Incidents',
+                style: TextStyle(
+                  color: AppColors.textMain(context),
+                  fontSize: 24,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                needs == 0
+                    ? 'All caught up — no incidents waiting on a response'
+                    : 'Live detections, response actions and Task Force backup',
+                style: TextStyle(color: AppColors.textMuted(context), fontSize: 13),
+              ),
+            ],
+          ),
+        ),
+        _BackupButton(
+          stream: widget.requestsStream,
+          camerasById: widget.camerasById,
+          onTap: widget.onOpenBackups,
+        ),
+      ],
+    );
+  }
+
+  // ----- Stat cards (clickable filters) -----
+
+  Widget _buildStatRow(List<_Incident> all) {
+    final levels = AlertLevel.values;
+    final needsTotal = all.where(_needsAction).length;
+    final total = all.length;
+
+    return LayoutBuilder(builder: (context, c) {
+      const gap = 14.0;
+      final perRow =
+          c.maxWidth >= 980 ? (1 + levels.length) : (c.maxWidth >= 640 ? 3 : 2);
+      final w = (c.maxWidth - gap * (perRow - 1)) / perRow;
+
+      final cards = <Widget>[
+        _StatCard(
+          label: 'Needs action',
+          count: needsTotal,
+          caption: needsTotal == 0 ? 'All caught up' : 'Awaiting response',
+          color: _kAmber,
+          icon: Icons.notifications_active_outlined,
+          share: total == 0 ? 0 : needsTotal / total,
+          selected: _status == _StatusFilter.needsAction && _level == null,
+          onTap: () => setState(() {
+            _level = null;
+            _status = _status == _StatusFilter.needsAction
+                ? _StatusFilter.all
+                : _StatusFilter.needsAction;
+            _page = 0;
+          }),
+        ),
+        for (final level in levels)
+          Builder(builder: (context) {
+            final ofLevel = all.where((i) => i.alertLevel == level).toList();
+            final pending = ofLevel.where(_needsAction).length;
+            return _StatCard(
+              label: '${_levelName(level)} alerts',
+              count: ofLevel.length,
+              caption: pending == 0 ? 'None pending' : '$pending need action',
+              captionColor: pending == 0 ? null : level.color,
+              color: level.color,
+              icon: Icons.warning_amber_rounded,
+              share: total == 0 ? 0 : ofLevel.length / total,
+              selected: _level == level,
+              onTap: () => setState(() {
+                _level = _level == level ? null : level;
+                _page = 0;
+              }),
+            );
+          }),
+      ];
+
+      return Wrap(
+        spacing: gap,
+        runSpacing: gap,
+        children: [for (final card in cards) SizedBox(width: w, child: card)],
+      );
+    });
+  }
+
+  // ----- Toolbar (search, status pills, sort, view toggle) -----
+
+  Widget _buildToolbarRow(List<_Incident> all, int shownCount) {
+    final needs = all.where(_needsAction).length;
+    final falseCount = all.where((i) => i.status == 'false_detection').length;
+    final handled = all.length - needs - falseCount;
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        SizedBox(
+          width: 280,
+          height: 38,
+          child: _buildSearchField(),
+        ),
+        const SizedBox(width: 14),
+        Expanded(
+          child: _StatusFilterSegmented(
+            selected: _status,
+            counts: {
+              _StatusFilter.all: all.length,
+              _StatusFilter.needsAction: needs,
+              _StatusFilter.handled: handled < 0 ? 0 : handled,
+              _StatusFilter.falseDetection: falseCount,
+            },
+            onChanged: (value) => setState(() {
+              _status = value;
+              _page = 0;
+            }),
+          ),
+        ),
+        const SizedBox(width: 12),
+        _buildSortMenu(),
+        const SizedBox(width: 10),
+        _ViewToggle(
+          grid: _gridView,
+          onChanged: (grid) => setState(() => _gridView = grid),
+        ),
+      ],
+    );
+  }
+
+  /// Same bordered search bar as Users: grey border, blue border and blue
+  /// search icon while focused, radius 10, height 38.
+  Widget _buildSearchField() {
+    final focused = _searchFocusNode.hasFocus;
+    return TextField(
+      controller: _searchController,
+      focusNode: _searchFocusNode,
+      style: TextStyle(color: AppColors.textMain(context), fontSize: 13),
+      onChanged: (val) => setState(() {
+        _query = val;
+        _page = 0;
+      }),
+      decoration: InputDecoration(
+        hintText: 'Search by location, type or level',
+        hintStyle: TextStyle(color: AppColors.textMuted(context), fontSize: 13),
+        prefixIcon: Icon(Icons.search,
+            size: 16,
+            color: focused ? AppColors.accentBlue : AppColors.textMuted(context)),
+        suffixIcon: _query.isEmpty
+            ? null
+            : IconButton(
+                icon: Icon(Icons.close,
+                    size: 16, color: AppColors.textMuted(context)),
+                splashRadius: 14,
+                onPressed: () => setState(() {
+                  _searchController.clear();
+                  _query = '';
+                  _page = 0;
+                }),
+              ),
+        filled: true,
+        fillColor: AppColors.card(context),
+        isDense: true,
+        contentPadding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: BorderSide(color: AppColors.border(context)),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: BorderSide(color: AppColors.border(context)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: AppColors.accentBlue, width: 1.5),
+        ),
+      ),
+    );
+  }
+
+  String _sortLabel(_IncidentSort s) => switch (s) {
+        _IncidentSort.newest => 'Newest first',
+        _IncidentSort.oldest => 'Oldest first',
+        _IncidentSort.severity => 'Most severe',
+      };
+
+  Widget _buildSortMenu() {
+    return PopupMenuButton<_IncidentSort>(
+      tooltip: 'Sort incidents',
+      color: AppColors.card(context),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(10),
+        side: BorderSide(color: AppColors.border(context)),
+      ),
+      onSelected: (s) => setState(() {
+        _sort = s;
+        _page = 0;
+      }),
+      itemBuilder: (context) => [
+        for (final s in _IncidentSort.values)
+          PopupMenuItem<_IncidentSort>(
+            value: s,
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 18,
+                  child: _sort == s
+                      ? Icon(Icons.check, size: 15, color: AppColors.accentBlue)
+                      : null,
+                ),
+                Text(_sortLabel(s),
+                    style: TextStyle(
+                        color: AppColors.textMain(context), fontSize: 13)),
+              ],
+            ),
+          ),
+      ],
+      child: Container(
+        height: 38, // matches search bar / Users toolbar controls
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        decoration: BoxDecoration(
+          color: AppColors.card(context),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: AppColors.border(context)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.swap_vert, color: AppColors.textMuted(context), size: 15),
+            const SizedBox(width: 6),
+            Text(_sortLabel(_sort),
+                style: TextStyle(
+                    color: AppColors.textMain(context),
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600)),
+            const SizedBox(width: 2),
+            Icon(Icons.arrow_drop_down,
+                color: AppColors.textMuted(context), size: 18),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ----- Grid / list bodies -----
+
+  Widget _buildGrid(List<_Incident> items) {
+    return GridView.builder(
+      padding: const EdgeInsets.all(16),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 340,
+        crossAxisSpacing: 14,
+        mainAxisSpacing: 14,
+        childAspectRatio: 1.2,
+      ),
+      itemCount: items.length,
+      itemBuilder: (context, index) {
+        final incident = items[index];
+        final name = _cameraName(incident);
+        return _IncidentTile(
+          incident: incident,
+          cameraName: name,
+          reportCount: widget.reportsByIncident[incident.id]?.length ?? 0,
+          onTap: () => widget.onOpenIncident(incident, name),
+        );
+      },
+    );
+  }
+
+  Widget _buildListHeader() {
+    TextStyle style() => TextStyle(
+        color: AppColors.textMuted(context),
+        fontSize: 10.5,
+        fontWeight: FontWeight.w700,
+        letterSpacing: 0.6);
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.sunken(context),
+        border: Border(
+          bottom: BorderSide(color: AppColors.border(context), width: 1),
+        ),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+      child: Row(
+        children: [
+          Expanded(flex: 3, child: Text('INCIDENT', style: style())),
+          Expanded(flex: 3, child: Text('LOCATION', style: style())),
+          Expanded(flex: 2, child: Text('TIME', style: style())),
+          Expanded(flex: 2, child: Text('STATUS', style: style())),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildList(List<_Incident> items) {
+    return ListView.separated(
+      itemCount: items.length,
+      separatorBuilder: (_, __) =>
+          Divider(color: AppColors.border(context), height: 1, thickness: 1),
+      itemBuilder: (context, index) {
+        final incident = items[index];
+        final name = _cameraName(incident);
+        return _IncidentRowTile(
+          incident: incident,
+          cameraName: name,
+          reportCount: widget.reportsByIncident[incident.id]?.length ?? 0,
+          onTap: () => widget.onOpenIncident(incident, name),
+        );
+      },
+    );
+  }
+
+  Widget _buildEmptyState(bool noData) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 64,
+              height: 64,
+              decoration: BoxDecoration(
+                color: AppColors.sunken(context),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(
+                noData ? Icons.videocam_off_outlined : Icons.search_off,
+                color: AppColors.textMuted(context),
+                size: 28,
+              ),
+            ),
+            const SizedBox(height: 14),
+            Text(
+              noData ? 'No incidents recorded yet' : 'No incidents match',
+              style: TextStyle(
+                  color: AppColors.textMain(context),
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              noData
+                  ? 'New detections from your cameras will show up here.'
+                  : 'Try a different search or clear your filters.',
+              style: TextStyle(color: AppColors.textMuted(context), fontSize: 12.5),
+            ),
+            if (!noData && _hasFilters) ...[
+              const SizedBox(height: 14),
+              OutlinedButton(
+                onPressed: _resetFilters,
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppColors.textMain(context),
+                  side: BorderSide(color: AppColors.border(context)),
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10)),
+                ),
+                child: const Text('Clear filters',
+                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700)),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ----- Pager -----
+
+  Widget _buildPagePicker({required int currentPage, required int totalPages}) {
+    const int windowSize = 1;
+
+    List<int> pageNumbers() {
+      final pages = <int>{0, totalPages - 1, currentPage};
+      for (int i = 1; i <= windowSize; i++) {
+        if (currentPage - i >= 0) pages.add(currentPage - i);
+        if (currentPage + i < totalPages) pages.add(currentPage + i);
+      }
+      return pages.toList()..sort();
+    }
+
+    Widget arrowButton(IconData icon, VoidCallback? onTap) {
+      return SizedBox(
+        width: 28,
+        height: 28,
+        child: IconButton(
+          padding: EdgeInsets.zero,
+          onPressed: onTap,
+          icon: Icon(icon, size: 16, color: AppColors.textMuted(context)),
+          splashRadius: 16,
+        ),
+      );
+    }
+
+    Widget pageButton(int index) {
+      final isCurrent = index == currentPage;
+      return InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: isCurrent ? null : () => setState(() => _page = index),
+        child: Container(
+          width: 28,
+          height: 28,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: isCurrent ? AppColors.accentBlue : Colors.transparent,
+            borderRadius: BorderRadius.circular(8),
+            border: isCurrent ? null : Border.all(color: AppColors.border(context)),
+          ),
+          child: Text(
+            '${index + 1}',
+            style: TextStyle(
+              color: isCurrent ? Colors.white : AppColors.textMuted(context),
+              fontSize: 11.5,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      );
+    }
+
+    final pages = pageNumbers();
+    final widgets = <Widget>[
+      arrowButton(Icons.chevron_left,
+          currentPage > 0 ? () => setState(() => _page--) : null),
+      const SizedBox(width: 4),
+    ];
+    for (int i = 0; i < pages.length; i++) {
+      if (i > 0 && pages[i] - pages[i - 1] > 1) {
+        widgets.add(Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text('…',
+              style: TextStyle(color: AppColors.textMuted(context), fontSize: 11.5)),
+        ));
+      }
+      widgets.add(pageButton(pages[i]));
+      if (i != pages.length - 1) widgets.add(const SizedBox(width: 4));
+    }
+    widgets.add(const SizedBox(width: 4));
+    widgets.add(arrowButton(Icons.chevron_right,
+        currentPage < totalPages - 1 ? () => setState(() => _page++) : null));
+
+    return Row(mainAxisSize: MainAxisSize.min, children: widgets);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stat card — icon chip + count + label + share bar (matches Users screen)
+// ---------------------------------------------------------------------------
+
+class _StatCard extends StatefulWidget {
+  final String label;
+  final int count;
+  final String caption;
+  final Color? captionColor;
+  final Color color;
+  final IconData icon;
+  final double share;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _StatCard({
+    required this.label,
+    required this.count,
+    required this.caption,
+    required this.color,
+    required this.icon,
+    required this.share,
+    required this.selected,
+    required this.onTap,
+    this.captionColor,
+  });
+
+  @override
+  State<_StatCard> createState() => _StatCardState();
+}
+
+class _StatCardState extends State<_StatCard> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.color;
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: AppColors.card(context),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: widget.selected
+                  ? c
+                  : (_hover ? c.withOpacity(0.5) : AppColors.border(context)),
+              width: widget.selected ? 1.6 : 1,
+            ),
+            boxShadow: _hover
+                ? [
+                    BoxShadow(
+                      color: c.withOpacity(0.14),
+                      blurRadius: 18,
+                      offset: const Offset(0, 8),
+                    )
+                  ]
+                : const [],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: c.withOpacity(0.14),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Icon(widget.icon, size: 18, color: c),
+                  ),
+                  Expanded(
+                    child: Align(
+                      alignment: Alignment.centerRight,
+                      child: Text(
+                        widget.caption,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.right,
+                        style: TextStyle(
+                          color: widget.captionColor ?? AppColors.textMuted(context),
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Text(
+                '${widget.count}',
+                style: TextStyle(
+                  color: AppColors.textMain(context),
+                  fontSize: 28,
+                  height: 1,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                widget.label,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: AppColors.textMuted(context),
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 12),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: widget.share.clamp(0.0, 1.0),
+                  minHeight: 4,
+                  backgroundColor: c.withOpacity(0.12),
+                  valueColor: AlwaysStoppedAnimation<Color>(c),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Segmented status filter — one continuous pill, one segment highlighted at
+/// a time. Mirrors the Users screen's `_RoleFilterSegmented` exactly (same
+/// height, padding, radius, and selected-state treatment).
+class _StatusFilterSegmented extends StatelessWidget {
+  final _StatusFilter selected;
+  final Map<_StatusFilter, int> counts;
+  final ValueChanged<_StatusFilter> onChanged;
+
+  const _StatusFilterSegmented({
+    required this.selected,
+    required this.counts,
+    required this.onChanged,
+  });
+
+  static const _labels = {
+    _StatusFilter.all: 'All',
+    _StatusFilter.needsAction: 'Needs action',
+    _StatusFilter.handled: 'Handled',
+    _StatusFilter.falseDetection: 'False detections',
+  };
+
+  Color _colorFor(BuildContext context, _StatusFilter value) {
+    switch (value) {
+      case _StatusFilter.all:
+        return AppColors.accentBlue;
+      case _StatusFilter.needsAction:
+        return _kAmber;
+      case _StatusFilter.handled:
+        return AppColors.accentGreen;
+      case _StatusFilter.falseDetection:
+        return AppColors.textMuted(context);
+    }
+  }
+
+  Widget _segment(BuildContext context, _StatusFilter value) {
+    final isSelected = selected == value;
+    final color = _colorFor(context, value);
+    final count = counts[value] ?? 0;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => onChanged(value),
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 140),
+            height: 30,
+            alignment: Alignment.center,
+            padding: const EdgeInsets.symmetric(horizontal: 6),
+            decoration: BoxDecoration(
+              color: isSelected ? color.withOpacity(0.16) : Colors.transparent,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Flexible(
+                  child: Text(
+                    _labels[value]!,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: isSelected
+                          ? AppColors.textMain(context)
+                          : AppColors.textMuted(context),
+                      fontSize: 11.5,
+                      fontWeight: isSelected ? FontWeight.w700 : FontWeight.w600,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 5),
+                Text(
+                  '$count',
+                  style: TextStyle(
+                    color: isSelected ? color : AppColors.textMuted(context),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 38,
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: AppColors.card(context),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.border(context)),
+      ),
+      child: Row(
+        children: [
+          for (final value in _StatusFilter.values) _segment(context, value),
+        ],
+      ),
+    );
+  }
+}
+
+/// Same shape/sizing as the Users screen's view toggle: radius 10, height 38,
+/// 4px padding. Uses `.withOpacity(0)` on the SAME color instead of
+/// `Colors.transparent` so AnimatedContainer never lerps through a black tint
+/// (the light-mode "flash").
+class _ViewToggle extends StatelessWidget {
+  final bool grid;
+  final ValueChanged<bool> onChanged;
+
+  const _ViewToggle({required this.grid, required this.onChanged});
+
+  Widget _segment(BuildContext context, IconData icon, bool isGrid, String tip) {
+    final selected = grid == isGrid;
+    return Tooltip(
+      message: tip,
+      child: GestureDetector(
+        onTap: () => onChanged(isGrid),
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 140),
+            width: 36,
+            height: 30,
+            decoration: BoxDecoration(
+              color: AppColors.accentBlue.withOpacity(selected ? 0.16 : 0),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(icon,
+                size: 17,
+                color: selected
+                    ? AppColors.accentBlue
+                    : AppColors.textMuted(context)),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 38,
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: AppColors.card(context),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.border(context)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _segment(context, Icons.grid_view_rounded, true, 'Card view'),
+          _segment(context, Icons.view_list_rounded, false, 'List view'),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Card view — image on top, three lines of text underneath
+// ---------------------------------------------------------------------------
+
+class _IncidentTile extends StatefulWidget {
+  final _Incident incident;
+  final String cameraName;
+  final int reportCount;
+  final VoidCallback onTap;
+
+  const _IncidentTile({
+    required this.incident,
+    required this.cameraName,
+    required this.onTap,
+    this.reportCount = 0,
+  });
+
+  @override
+  State<_IncidentTile> createState() => _IncidentTileState();
+}
+
+class _IncidentTileState extends State<_IncidentTile> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final incident = widget.incident;
+    final status = _statusInfoFor(context, incident.status);
+    final title = incident.alertType.isEmpty
+        ? _levelName(incident.alertLevel)
+        : incident.alertType;
+
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            color: AppColors.card(context),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: _hover
+                  ? incident.alertLevel.color.withOpacity(0.6)
+                  : AppColors.border(context),
+            ),
+            boxShadow: _hover
+                ? [
+                    BoxShadow(
+                      color: incident.alertLevel.color.withOpacity(0.12),
+                      blurRadius: 18,
+                      offset: const Offset(0, 8),
+                    )
+                  ]
+                : const [],
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: Image.network(
+                  incident.imageUrl,
+                  fit: BoxFit.cover,
+                  loadingBuilder: (context, child, progress) => progress == null
+                      ? child
+                      : Container(
+                          color: AppColors.sunken(context),
+                          child: const Center(
+                            child: SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          ),
+                        ),
+                  errorBuilder: (context, error, stack) => Container(
+                    color: AppColors.sunken(context),
+                    child: Icon(Icons.broken_image_outlined,
+                        color: AppColors.textMuted(context)),
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        _LevelDot(color: incident.alertLevel.color),
+                        const SizedBox(width: 7),
+                        Expanded(
+                          child: Text(
+                            title,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: AppColors.textMain(context),
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      widget.cameraName,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          color: AppColors.textMuted(context), fontSize: 12),
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _relativeTime(incident.occurredAt),
+                            style: TextStyle(
+                                color: AppColors.textMuted(context),
+                                fontSize: 11.5),
+                          ),
+                        ),
+                        if (widget.reportCount > 0) ...[
+                          Tooltip(
+                            message: '${widget.reportCount} field report(s) filed',
+                            child: Row(
+                              children: [
+                                Icon(Icons.description_outlined,
+                                    size: 13, color: AppColors.accentBlue),
+                                const SizedBox(width: 3),
+                                Text(
+                                  '${widget.reportCount}',
+                                  style: TextStyle(
+                                    color: AppColors.accentBlue,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                        ],
+                        _StatusText(info: status),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Table view — plain rows (no thumbnails, no pills)
+// ---------------------------------------------------------------------------
+
+class _IncidentRowTile extends StatefulWidget {
+  final _Incident incident;
+  final String cameraName;
+  final int reportCount;
+  final VoidCallback onTap;
+
+  const _IncidentRowTile({
+    required this.incident,
+    required this.cameraName,
+    required this.onTap,
+    this.reportCount = 0,
+  });
+
+  @override
+  State<_IncidentRowTile> createState() => _IncidentRowTileState();
+}
+
+class _IncidentRowTileState extends State<_IncidentRowTile> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final incident = widget.incident;
+    final status = _statusInfoFor(context, incident.status);
+    final title =
+        incident.alertType.isEmpty ? 'Unknown type' : incident.alertType;
+
+    TextStyle cell() => TextStyle(
+        color: AppColors.textMain(context),
+        fontSize: 12.5,
+        fontWeight: FontWeight.w500);
+
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.onTap,
+        child: Container(
+          // withOpacity(0) of the SAME color, so theme switches don't flash.
+          color: AppColors.sunken(context).withOpacity(_hover ? 1 : 0),
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 13),
+          child: Row(
+            children: [
+              Expanded(
+                flex: 3,
+                child: Row(
+                  children: [
+                    _LevelDot(color: incident.alertLevel.color),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(title,
+                          overflow: TextOverflow.ellipsis, style: cell()),
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                flex: 3,
+                child: Text(widget.cameraName,
+                    overflow: TextOverflow.ellipsis, style: cell()),
+              ),
+              Expanded(
+                flex: 2,
+                child: Text(
+                  DateFormat('MMM d, h:mm a').format(incident.occurredAt),
+                  overflow: TextOverflow.ellipsis,
+                  style: cell().copyWith(color: AppColors.textMuted(context)),
+                ),
+              ),
+              Expanded(
+                flex: 2,
+                child: Row(
+                  children: [
+                    Flexible(child: _StatusText(info: status)),
+                    if (widget.reportCount > 0) ...[
+                      const SizedBox(width: 8),
+                      Tooltip(
+                        message: '${widget.reportCount} field report(s) filed',
+                        child: Icon(Icons.description_outlined,
+                            size: 13, color: AppColors.accentBlue),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BACKUP REQUESTS — toolbar button
+// ---------------------------------------------------------------------------
+
+/// Compact toolbar button. Muted when nothing is waiting; turns red and pulses
+/// with a count badge when backup requests are pending. Hover shows which
+/// locations are asking and how long the oldest has waited. Tap opens the
+/// Backup drawer.
+class _BackupButton extends StatefulWidget {
+  final Stream<List<Map<String, dynamic>>> stream;
+  final Map<String, CctvCamera> camerasById;
+  final VoidCallback onTap;
+
+  const _BackupButton({
+    required this.stream,
+    required this.camerasById,
+    required this.onTap,
+  });
+
+  @override
+  State<_BackupButton> createState() => _BackupButtonState();
+}
+
+class _BackupButtonState extends State<_BackupButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _pulse;
+  Timer? _tick;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    )..repeat();
+    _tick = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<List<Map<String, dynamic>>>(
+      stream: widget.stream,
+      builder: (context, snapshot) {
+        final pending = (snapshot.data ?? const <Map<String, dynamic>>[])
+            .where((r) => (r['status'] ?? '').toString() == 'pending')
+            .map(_TaskForceRequest.fromMap)
+            .toList()
+          ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+
+        final n = pending.length;
+        final hasPending = n > 0;
+        final base = AppColors.accentRed;
+        final oldestWait = hasPending
+            ? DateTime.now().difference(pending.first.createdAt)
+            : Duration.zero;
+        final urgent = hasPending && oldestWait.inMinutes >= 5;
+        final fg = hasPending ? base : AppColors.textMuted(context);
+
+        String tooltip = 'No backup requests waiting';
+        if (hasPending) {
+          final places = pending
+              .map((r) => _cameraLabel(widget.camerasById[r.cameraId]))
+              .toSet()
+              .toList();
+          final preview = places.take(2).join(', ') +
+              (places.length > 2 ? ' +${places.length - 2} more' : '');
+          tooltip = '$preview\nOldest waiting ${_waitLabel(oldestWait)}';
+        }
+
+        return Tooltip(
+          message: tooltip,
+          child: MouseRegion(
+            cursor: SystemMouseCursors.click,
+            child: GestureDetector(
+              onTap: widget.onTap,
+              // Outer: theme-dependent fallback color/border when nothing
+              // is pending (AppColors.card / AppColors.border) — snaps
+              // instantly on a light/dark switch.
+              child: Container(
+                height: 40,
+                decoration: BoxDecoration(
+                  color: hasPending ? Colors.transparent : AppColors.card(context),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: hasPending ? Colors.transparent : AppColors.border(context),
+                  ),
+                ),
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 160),
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  decoration: BoxDecoration(
+                    // Only theme-independent colors (base = accentRed) are
+                    // tweened here, driven by the pending/urgent state —
+                    // never by the theme.
+                    color: hasPending
+                        ? base.withOpacity(urgent ? 0.20 : 0.12)
+                        : Colors.transparent,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: hasPending
+                          ? base.withOpacity(urgent ? 0.9 : 0.5)
+                          : Colors.transparent,
+                    ),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            if (hasPending)
+                              AnimatedBuilder(
+                                animation: _pulse,
+                                builder: (context, _) {
+                                  final t = _pulse.value;
+                                  return Container(
+                                    width: 16 + 8 * t,
+                                    height: 16 + 8 * t,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      color: base.withOpacity(0.3 * (1 - t)),
+                                    ),
+                                  );
+                                },
+                              ),
+                            Icon(Icons.headset_mic, size: 16, color: fg),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        'Backup requests',
+                        style: TextStyle(
+                          color: hasPending
+                              ? AppColors.textMain(context)
+                              : AppColors.textMuted(context),
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      if (hasPending) ...[
+                        const SizedBox(width: 8),
+                        Container(
+                          constraints: const BoxConstraints(minWidth: 20),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: base,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            '$n',
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w800),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BACKUP REQUESTS — drawer + ticket cards
+// ---------------------------------------------------------------------------
+
+class _BackupDrawer extends StatelessWidget {
+  final Stream<List<Map<String, dynamic>>> requestsStream;
+  final Map<String, _Incident> incidentsById;
+  final Map<String, CctvCamera> camerasById;
+  final VoidCallback onClose;
+  final Future<void> Function(_TaskForceRequest request) onDispatch;
+
+  const _BackupDrawer({
+    required this.requestsStream,
+    required this.incidentsById,
+    required this.camerasById,
+    required this.onClose,
+    required this.onDispatch,
+  });
+
+  List<_TaskForceRequest> _pending(List<Map<String, dynamic>>? rows) {
+    return (rows ?? const <Map<String, dynamic>>[])
+        .where((r) => (r['status'] ?? '').toString() == 'pending')
+        .map(_TaskForceRequest.fromMap)
+        .toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt)); // longest waiting first
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _SidePanelShell(
+      header: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Container(
+              width: 34,
+              height: 34,
+              decoration: BoxDecoration(
+                color: AppColors.accentRed.withOpacity(0.14),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(Icons.headset_mic, color: AppColors.accentRed, size: 17),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: StreamBuilder<List<Map<String, dynamic>>>(
+                stream: requestsStream,
+                builder: (context, snapshot) {
+                  final count = _pending(snapshot.data).length;
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Backup requests',
+                          style: TextStyle(
+                              color: AppColors.textMain(context),
+                              fontSize: 16,
+                              fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 1),
+                      Text(
+                        count == 0
+                            ? 'Nothing waiting'
+                            : '$count waiting • longest first',
+                        style: TextStyle(
+                            color: AppColors.textMuted(context), fontSize: 11.5),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+            InkWell(
+              onTap: onClose,
+              borderRadius: BorderRadius.circular(20),
+              child: Container(
+                padding: const EdgeInsets.all(4),
+                decoration: BoxDecoration(
+                  color: AppColors.border(context).withOpacity(0.6),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(Icons.close, color: AppColors.textMain(context), size: 16),
+              ),
+            ),
+          ],
+        ),
+      ),
+      content: StreamBuilder<List<Map<String, dynamic>>>(
+        stream: requestsStream,
+        builder: (context, snapshot) {
+          final requests = _pending(snapshot.data);
+          if (requests.isEmpty) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 60,
+                      height: 60,
+                      decoration: BoxDecoration(
+                        color: AppColors.accentGreen.withOpacity(0.12),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(Icons.check_rounded,
+                          color: AppColors.accentGreen, size: 30),
+                    ),
+                    const SizedBox(height: 14),
+                    Text('All caught up',
+                        style: TextStyle(
+                            color: AppColors.textMain(context),
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 4),
+                    Text('New Task Force backup requests will appear here.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                            color: AppColors.textMuted(context), fontSize: 12.5)),
+                  ],
+                ),
+              ),
+            );
+          }
+
+          return ListView.separated(
+            padding: const EdgeInsets.all(16),
+            itemCount: requests.length,
+            separatorBuilder: (_, __) => const SizedBox(height: 12),
+            itemBuilder: (context, index) {
+              final request = requests[index];
+              return _BackupTicket(
+                key: ValueKey(request.id),
+                request: request,
+                incident: incidentsById[request.incidentId],
+                cameraName: _cameraLabel(camerasById[request.cameraId]),
+                onDispatch: () => onDispatch(request),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _BackupTicket extends StatefulWidget {
+  final _TaskForceRequest request;
+  final _Incident? incident;
+  final String cameraName;
+  final Future<void> Function() onDispatch;
+
+  const _BackupTicket({
+    super.key,
+    required this.request,
+    required this.incident,
+    required this.cameraName,
+    required this.onDispatch,
+  });
+
+  @override
+  State<_BackupTicket> createState() => _BackupTicketState();
+}
+
+class _BackupTicketState extends State<_BackupTicket> {
+  Timer? _tick;
+  bool _dispatching = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _tick = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _dispatch() async {
+    if (_dispatching) return;
+    setState(() => _dispatching = true);
+    try {
+      await widget.onDispatch();
+    } finally {
+      if (mounted) setState(() => _dispatching = false);
+    }
+  }
+
+  Widget _infoRow(IconData icon, String text) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 5),
+      child: Row(
+        children: [
+          Icon(icon, size: 13, color: AppColors.textMuted(context)),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              text,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                  color: AppColors.textMain(context),
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final request = widget.request;
+    final incident = widget.incident;
+    final wait = DateTime.now().difference(request.createdAt);
+
+    // Urgency by how long the tanod team has been waiting.
+    final Color waitColor = wait.inMinutes >= 8
+        ? AppColors.accentRed
+        : wait.inMinutes >= 3
+            ? _kAmber
+            : AppColors.accentGreen;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.card(context),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: waitColor.withOpacity(0.5)),
+      ),
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Incident snapshot, so command center recognises the scene at a glance.
+              Container(
+                width: 68,
+                height: 68,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: (incident?.alertLevel.color ?? AppColors.border(context))
+                        .withOpacity(0.8),
+                    width: 1.5,
+                  ),
+                  color: AppColors.sunken(context),
+                ),
+                clipBehavior: Clip.antiAlias,
+                child: incident == null
+                    ? Icon(Icons.image_not_supported_outlined,
+                        color: AppColors.textMuted(context), size: 20)
+                    : Image.network(
+                        incident.imageUrl,
+                        fit: BoxFit.cover,
+                        errorBuilder: (context, error, stack) => const Icon(
+                            Icons.broken_image,
+                            color: Colors.white24,
+                            size: 20),
+                      ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            incident == null || incident.alertType.isEmpty
+                                ? 'Unknown incident'
+                                : incident.alertType,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                                color: AppColors.textMain(context),
+                                fontSize: 13.5,
+                                fontWeight: FontWeight.w800),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 7, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: waitColor.withOpacity(0.14),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.timer_outlined, size: 11, color: waitColor),
+                              const SizedBox(width: 3),
+                              Text(_waitLabel(wait),
+                                  style: TextStyle(
+                                      color: waitColor,
+                                      fontSize: 10.5,
+                                      fontWeight: FontWeight.w800)),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 5),
+                    Row(
+                      children: [
+                        if (incident != null) ...[
+                          _LevelPill(
+                              text: _levelName(incident.alertLevel),
+                              color: incident.alertLevel.color),
+                        ],
+                      ],
+                    ),
+                    _infoRow(Icons.place_outlined, widget.cameraName),
+                    _infoRow(Icons.shield_outlined,
+                        'Tanod team • requested ${_relativeTime(request.createdAt).toLowerCase()}'),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          // Dispatch is the only action on a backup request.
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _dispatching ? null : _dispatch,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.accentRed,
+                foregroundColor: Colors.white,
+                disabledBackgroundColor: AppColors.accentRed.withOpacity(0.5),
+                disabledForegroundColor: Colors.white70,
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(vertical: 13),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10)),
+              ),
+              icon: _dispatching
+                  ? const SizedBox(
+                      width: 13,
+                      height: 13,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: Colors.white),
+                    )
+                  : const Icon(Icons.groups_outlined, size: 15),
+              label: const Text('DISPATCH TASK FORCE',
+                  style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.4)),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SHARED MAP PANE FOR THE DISPATCH SHEETS
+// ---------------------------------------------------------------------------
+
+class _MapPoint {
+  final String name;
+  final double lat;
+  final double lng;
+  final bool isLead;
+
+  const _MapPoint({
+    required this.name,
+    required this.lat,
+    required this.lng,
+    this.isLead = false,
+  });
+
+  String get _key => '$lat,$lng';
+}
+
+class _RouteResult {
+  final List<ll.LatLng> points;
+  final double distanceKm;
+  final double durationMin;
+
+  const _RouteResult({
+    required this.points,
+    required this.distanceKm,
+    required this.durationMin,
+  });
+}
+
+/// Road routing via the public OSRM demo server (rate-limited — swap for a
+/// self-hosted OSRM/Mapbox/Google endpoint in production). Requests
+/// alternatives and explicitly picks the lowest-duration route. Cached per
+/// (from, to) pair. Needs `http: ^1.2.0` in pubspec.yaml.
+class _RoutingService {
+  static final Map<String, _RouteResult?> _cache = {};
+
+  static Future<_RouteResult?> fetchRoute({
+    required double fromLat,
+    required double fromLng,
+    required double toLat,
+    required double toLng,
+  }) async {
+    final key = '${fromLat.toStringAsFixed(5)},${fromLng.toStringAsFixed(5)}'
+        '->${toLat.toStringAsFixed(5)},${toLng.toStringAsFixed(5)}';
+    if (_cache.containsKey(key)) return _cache[key];
+
+    try {
+      final uri = Uri.parse(
+        'https://router.project-osrm.org/route/v1/driving/'
+        '$fromLng,$fromLat;$toLng,$toLat'
+        '?alternatives=true&overview=full&geometries=geojson',
+      );
+      final response = await http.get(uri).timeout(const Duration(seconds: 8));
+      if (response.statusCode != 200) {
+        _cache[key] = null;
+        return null;
+      }
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final routes = data['routes'] as List?;
+      if (routes == null || routes.isEmpty) {
+        _cache[key] = null;
+        return null;
+      }
+
+      Map<String, dynamic>? fastest;
+      double fastestDuration = double.infinity;
+      for (final r in routes) {
+        final route = r as Map<String, dynamic>;
+        final duration = (route['duration'] as num).toDouble();
+        if (duration < fastestDuration) {
+          fastestDuration = duration;
+          fastest = route;
+        }
+      }
+      if (fastest == null) {
+        _cache[key] = null;
+        return null;
+      }
+
+      final coords = (fastest['geometry']['coordinates'] as List).cast<List>();
+      final points = coords
+          .map((c) => ll.LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble()))
+          .toList();
+      final result = _RouteResult(
+        points: points,
+        distanceKm: (fastest['distance'] as num).toDouble() / 1000,
+        durationMin: fastestDuration / 60,
+      );
+      _cache[key] = result;
+      return result;
+    } catch (_) {
+      _cache[key] = null;
+      return null;
+    }
+  }
+}
+
+/// Left pane of both picker sheets: incident camera + selected responders,
+/// road routes (dotted straight line while loading/failed), and a distance +
+/// travel-time readout. Re-fits the view whenever the selection changes.
+class _DispatchMapPane extends StatefulWidget {
+  final String cameraName;
+  final double? cameraLat;
+  final double? cameraLng;
+  final List<_MapPoint> selectedPoints;
+  final Color accentColor;
+
+  const _DispatchMapPane({
+    required this.cameraName,
+    required this.cameraLat,
+    required this.cameraLng,
+    required this.selectedPoints,
+    required this.accentColor,
+  });
+
+  @override
+  State<_DispatchMapPane> createState() => _DispatchMapPaneState();
+}
+
+class _DispatchMapPaneState extends State<_DispatchMapPane> {
+  final MapController _mapController = MapController();
+
+  // Keyed by "$lat,$lng". Value = route; explicit null = fetched and failed.
+  final Map<String, _RouteResult?> _routes = {};
+  int _requestGeneration = 0;
+
+  bool get _hasCamera => widget.cameraLat != null && widget.cameraLng != null;
+
+  @override
+  void initState() {
+    super.initState();
+    if (_hasCamera) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _refit(animate: false));
+      _fetchRoutes();
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _DispatchMapPane oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_hasCamera) return;
+    final oldKeys = oldWidget.selectedPoints.map((p) => p._key).toSet();
+    final newKeys = widget.selectedPoints.map((p) => p._key).toSet();
+    if (oldKeys.length != newKeys.length || !oldKeys.containsAll(newKeys)) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _refit(animate: true));
+      _fetchRoutes();
+    }
+  }
+
+  void _refit({required bool animate}) {
+    if (!mounted || !_hasCamera) return;
+    final cameraPoint = ll.LatLng(widget.cameraLat!, widget.cameraLng!);
+    final points = <ll.LatLng>[
+      cameraPoint,
+      ...widget.selectedPoints.map((p) => ll.LatLng(p.lat, p.lng)),
+    ];
+
+    for (final p in widget.selectedPoints) {
+      final route = _routes[p._key];
+      if (route != null && route.points.isNotEmpty) {
+        points.addAll(route.points);
+      }
+    }
+
+    if (points.length == 1) {
+      _mapController.move(cameraPoint, 15);
+      return;
+    }
+
+    final bounds = LatLngBounds.fromPoints(points);
+    _mapController.fitCamera(
+      CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(56)),
+    );
+  }
+
+  Future<void> _fetchRoutes() async {
+    if (!_hasCamera) return;
+    final generation = ++_requestGeneration;
+    final cameraLat = widget.cameraLat!;
+    final cameraLng = widget.cameraLng!;
+
+    final toFetch =
+        widget.selectedPoints.where((p) => !_routes.containsKey(p._key)).toList();
+    if (toFetch.isEmpty) return;
+
+    final results = await Future.wait(toFetch.map((p) => _RoutingService.fetchRoute(
+          fromLat: cameraLat,
+          fromLng: cameraLng,
+          toLat: p.lat,
+          toLng: p.lng,
+        )));
+
+    if (!mounted || generation != _requestGeneration) return;
+    setState(() {
+      for (var i = 0; i < toFetch.length; i++) {
+        _routes[toFetch[i]._key] = results[i];
+      }
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _refit(animate: true));
+  }
+
+  String _distanceLabel(double km) {
+    if (km < 1) return '${(km * 1000).round()} m away';
+    return '${km.toStringAsFixed(1)} km away';
+  }
+
+  String _durationLabel(double minutes) {
+    final total = minutes.round();
+    if (total < 1) return 'under a minute';
+    if (total < 60) return '$total min';
+    final hours = total ~/ 60;
+    final mins = total % 60;
+    return mins == 0 ? '$hours hr' : '$hours hr $mins min';
+  }
+
+  double _straightLineKm(_MapPoint p) {
+    const earthRadiusKm = 6371.0;
+    double degToRad(double d) => d * (math.pi / 180);
+    final dLat = degToRad(p.lat - widget.cameraLat!);
+    final dLng = degToRad(p.lng - widget.cameraLng!);
+    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(degToRad(widget.cameraLat!)) *
+            math.cos(degToRad(p.lat)) *
+            math.sin(dLng / 2) *
+            math.sin(dLng / 2);
+    final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+    return earthRadiusKm * c;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_hasCamera) {
+      return _emptyState(context, 'Camera has no location set.');
+    }
+
+    final cameraPoint = ll.LatLng(widget.cameraLat!, widget.cameraLng!);
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(14),
+      child: Stack(
+        children: [
+          FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: cameraPoint,
+              initialZoom: 15,
+              interactionOptions: const InteractionOptions(
+                flags: InteractiveFlag.all & ~InteractiveFlag.rotate,
+              ),
+            ),
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'com.barangay.cctv_manager',
+                retinaMode: true,
+              ),
+              PolylineLayer(
+                polylines: [
+                  for (final p in widget.selectedPoints)
+                    if (_routes[p._key] != null)
+                      Polyline(
+                        points: _routes[p._key]!.points,
+                        color: widget.accentColor.withOpacity(0.85),
+                        strokeWidth: 3,
+                      )
+                    else
+                      Polyline(
+                        points: [cameraPoint, ll.LatLng(p.lat, p.lng)],
+                        color: widget.accentColor.withOpacity(0.5),
+                        strokeWidth: 2,
+                        pattern: const StrokePattern.dotted(),
+                      ),
+                ],
+              ),
+              MarkerLayer(
+                markers: [
+                  Marker(
+                    point: cameraPoint,
+                    width: 34,
+                    height: 34,
+                    child: const _MapPin(
+                      icon: Icons.videocam,
+                      color: AppColors.accentRed,
+                    ),
+                  ),
+                  for (final p in widget.selectedPoints)
+                    Marker(
+                      point: ll.LatLng(p.lat, p.lng),
+                      width: 34,
+                      height: 34,
+                      child: _MapPin(
+                        icon: p.isLead ? Icons.person_pin : Icons.person_pin_circle,
+                        color: widget.accentColor,
+                      ),
+                    ),
+                ],
+              ),
+            ],
+          ),
+          Positioned(
+            left: 10,
+            right: 10,
+            bottom: 10,
+            child: Container(
+              constraints: const BoxConstraints(maxHeight: 160),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: AppColors.bg(context).withOpacity(0.92),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: AppColors.border(context)),
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _legendRow(context, Icons.videocam, AppColors.accentRed,
+                        widget.cameraName),
+                    for (final p in widget.selectedPoints) ...[
+                      const SizedBox(height: 6),
+                      Divider(height: 1, color: AppColors.border(context)),
+                      const SizedBox(height: 6),
+                      _legendRow(
+                        context,
+                        p.isLead ? Icons.person_pin : Icons.person_pin_circle,
+                        widget.accentColor,
+                        p.isLead ? '${p.name} (lead)' : p.name,
+                      ),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          Icon(
+                            _routes[p._key] != null
+                                ? Icons.alt_route
+                                : Icons.social_distance,
+                            size: 12,
+                            color: AppColors.textMuted(context),
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              _routes[p._key] != null
+                                  ? '${_distanceLabel(_routes[p._key]!.distanceKm)} • '
+                                      '${_durationLabel(_routes[p._key]!.durationMin)} by road'
+                                  : (_routes.containsKey(p._key)
+                                      ? '${_distanceLabel(_straightLineKm(p))} (straight line)'
+                                      : 'Calculating fastest route…'),
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: AppColors.textMain(context),
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _legendRow(BuildContext context, IconData icon, Color color, String label) {
+    return Row(
+      children: [
+        Icon(icon, size: 13, color: color),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            label,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: AppColors.textMain(context),
+              fontSize: 11.5,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _emptyState(BuildContext context, String message) {
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.bg(context),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.border(context)),
+      ),
+      alignment: Alignment.center,
+      padding: const EdgeInsets.all(20),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.location_off, color: AppColors.textMuted(context), size: 28),
+          const SizedBox(height: 10),
+          Text(
+            message,
+            textAlign: TextAlign.center,
+            style: TextStyle(color: AppColors.textMuted(context), fontSize: 12.5),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MapPin extends StatelessWidget {
+  final IconData icon;
+  final Color color;
+
+  const _MapPin({required this.icon, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: color,
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white, width: 2),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.4),
+            blurRadius: 4,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Icon(icon, color: Colors.white, size: 18),
+    );
+  }
+}
+
+/// Shared chrome for the detail dialog, dispatch pickers and Backup drawer:
+/// rounded card with header / content / optional footer. `mainAxisSize.min`
+/// lets it shrink inside the centered detail dialog and is a no-op for the
+/// full-height side panels.
+class _SidePanelShell extends StatelessWidget {
+  final Widget header;
+  final Widget content;
+  final Widget? footer;
+
+  const _SidePanelShell({
+    required this.header,
+    required this.content,
+    this.footer,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: AppColors.card(context),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: AppColors.border(context)),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: double.infinity,
+            color: AppColors.sunken(context),
+            child: header,
+          ),
+          Divider(color: AppColors.border(context), height: 1, thickness: 1),
+          Expanded(child: content),
+          if (footer != null) ...[
+            Divider(color: AppColors.border(context), height: 1, thickness: 1),
+            Container(
+              width: double.infinity,
+              color: AppColors.card(context),
+              child: footer!,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// Header shared by the picker/detail sheets: icon chip + bold title (+
+/// optional subtitle) + close button, matching the Users screen's modal
+/// title bar treatment.
+Widget _sheetHeader(
+  BuildContext context,
+  String title,
+  VoidCallback onClose, {
+  IconData? icon,
+  Color? iconColor,
+  String? subtitle,
+}) {
+  final color = iconColor ?? AppColors.accentBlue;
+  return Padding(
+    padding: const EdgeInsets.fromLTRB(20, 14, 16, 14),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        if (icon != null) ...[
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.14),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Icon(icon, color: color, size: 17),
+          ),
+          const SizedBox(width: 12),
+        ],
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                title,
+                style: TextStyle(
+                    color: AppColors.textMain(context),
+                    fontSize: 15,
+                    fontWeight: FontWeight.w800),
+              ),
+              if (subtitle != null) ...[
+                const SizedBox(height: 1),
+                Text(
+                  subtitle,
+                  overflow: TextOverflow.ellipsis,
+                  style:
+                      TextStyle(color: AppColors.textMuted(context), fontSize: 11.5),
+                ),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(width: 12),
+        InkWell(
+          onTap: onClose,
+          borderRadius: BorderRadius.circular(20),
+          child: Container(
+            padding: const EdgeInsets.all(4),
+            decoration: BoxDecoration(
+              color: AppColors.border(context).withOpacity(0.6),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(Icons.close, color: AppColors.textMain(context), size: 16),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+/// Footer shared by both pickers: neutral CANCEL + accent primary action.
+Widget _sheetFooter(
+  BuildContext context, {
+  required VoidCallback onCancel,
+  required String confirmLabel,
+  required Color confirmColor,
+  required VoidCallback? onConfirm,
+}) {
+  return Padding(
+    padding: const EdgeInsets.all(16),
+    child: Row(
+      children: [
+        Expanded(
+          child: ElevatedButton(
+            onPressed: onCancel,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.border(context),
+              foregroundColor: AppColors.textMain(context),
+              elevation: 0,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+            child: const Text('CANCEL',
+                style: TextStyle(
+                    fontSize: 12, fontWeight: FontWeight.w800, letterSpacing: 0.5)),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: ElevatedButton(
+            onPressed: onConfirm,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: confirmColor,
+              foregroundColor: Colors.white,
+              elevation: 0,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+            ),
+            child: Text(confirmLabel,
+                style: const TextStyle(
+                    fontSize: 12, fontWeight: FontWeight.w800, letterSpacing: 0.5)),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+/// Shared search field for the picker lists.
+Widget _pickerSearchField(
+  BuildContext context, {
+  required TextEditingController controller,
+  required String hint,
+  required String query,
+  required ValueChanged<String> onChanged,
+  required VoidCallback onClear,
+  bool autofocus = false,
+}) {
+  return SizedBox(
+    height: 38,
+    child: TextField(
+      controller: controller,
+      autofocus: autofocus,
+      style: TextStyle(color: AppColors.textMain(context), fontSize: 13),
+      onChanged: onChanged,
+      decoration: InputDecoration(
+        hintText: hint,
+        hintStyle: TextStyle(color: AppColors.textMuted(context), fontSize: 13),
+        prefixIcon: Icon(Icons.search, color: AppColors.textMuted(context), size: 16),
+        suffixIcon: query.isEmpty
+            ? null
+            : IconButton(
+                icon: Icon(Icons.close, color: AppColors.textMuted(context), size: 15),
+                splashRadius: 14,
+                onPressed: onClear,
+              ),
+        filled: true,
+        fillColor: AppColors.bg(context),
+        isDense: true,
+        contentPadding: const EdgeInsets.symmetric(vertical: 8),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: BorderSide.none,
+        ),
+      ),
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PUROK LEADER PICKER
+// ---------------------------------------------------------------------------
+
+class _PurokLeaderPickerSheet extends StatefulWidget {
+  final List<_PurokLeader> leaders;
+  final CctvCamera? camera;
+  final void Function([_PurokLeader? result]) onClose;
+
+  const _PurokLeaderPickerSheet({
+    required this.leaders,
+    required this.camera,
+    required this.onClose,
+  });
+
+  @override
+  State<_PurokLeaderPickerSheet> createState() => _PurokLeaderPickerSheetState();
+}
+
+class _PurokLeaderPickerSheetState extends State<_PurokLeaderPickerSheet> {
+  String? _selectedId;
+  final TextEditingController _searchController = TextEditingController();
+  String _query = '';
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  List<_PurokLeader> get _filtered {
+    if (_query.isEmpty) return widget.leaders;
+    final q = _query.toLowerCase();
+    return widget.leaders.where((l) {
+      return l.name.toLowerCase().contains(q) ||
+          (l.purok ?? '').toLowerCase().contains(q);
+    }).toList();
+  }
+
+  String _distanceLabel(_PurokLeader leader) {
+    if (leader.distanceKm == null) return 'Location not set';
+    if (leader.distanceKm! < 1) return '${(leader.distanceKm! * 1000).round()} m away';
+    return '${leader.distanceKm!.toStringAsFixed(1)} km away';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final filtered = _filtered;
+    final selectedId = _selectedId ?? (filtered.isNotEmpty ? filtered.first.id : null);
+    final selected = selectedId == null
+        ? null
+        : widget.leaders.firstWhere((l) => l.id == selectedId,
+            orElse: () => filtered.first);
+
+    return _SidePanelShell(
+      header: _sheetHeader(
+        context,
+        'Send request to Purok Leader',
+        () => widget.onClose(),
+        icon: Icons.person_pin_circle_outlined,
+        iconColor: AppColors.accentBlue,
+        subtitle: '${widget.leaders.length} leaders available',
+      ),
+      content: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              flex: 5,
+              child: _DispatchMapPane(
+                cameraName: _cameraLabel(widget.camera),
+                cameraLat: widget.camera?.latitude,
+                cameraLng: widget.camera?.longitude,
+                selectedPoints: selected != null && selected.hasLocation
+                    ? [
+                        _MapPoint(
+                          name: selected.name,
+                          lat: selected.latitude!,
+                          lng: selected.longitude!,
+                        ),
+                      ]
+                    : const [],
+                accentColor: AppColors.accentBlue,
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              flex: 4,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _pickerSearchField(
+                    context,
+                    controller: _searchController,
+                    hint: 'Search by name or purok…',
+                    query: _query,
+                    autofocus: true,
+                    onChanged: (val) => setState(() => _query = val),
+                    onClear: () => setState(() {
+                      _searchController.clear();
+                      _query = '';
+                    }),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Showing ${filtered.length} of ${widget.leaders.length}'
+                    '${filtered.isNotEmpty && filtered.first.distanceKm != null ? ' • nearest first' : ''}',
+                    style: TextStyle(
+                        color: AppColors.textMuted(context),
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600),
+                  ),
+                  const SizedBox(height: 10),
+                  Expanded(
+                    child: filtered.isEmpty
+                        ? Center(
+                            child: Text('No leaders match your search.',
+                                style: TextStyle(
+                                    color: AppColors.textMuted(context),
+                                    fontSize: 13)),
+                          )
+                        : ListView.separated(
+                            itemCount: filtered.length,
+                            separatorBuilder: (_, __) => const SizedBox(height: 8),
+                            itemBuilder: (context, index) {
+                              final leader = filtered[index];
+                              final isSelected = leader.id == selectedId;
+                              final isTopOfList = index == 0;
+                              return InkWell(
+                                borderRadius: BorderRadius.circular(10),
+                                onTap: () => setState(() => _selectedId = leader.id),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 12, vertical: 10),
+                                  decoration: BoxDecoration(
+                                    color: isSelected
+                                        ? AppColors.accentBlue.withOpacity(0.12)
+                                        : AppColors.bg(context),
+                                    borderRadius: BorderRadius.circular(10),
+                                    border: Border.all(
+                                      color: isSelected
+                                          ? AppColors.accentBlue
+                                          : AppColors.border(context),
+                                    ),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      Icon(
+                                        isSelected
+                                            ? Icons.radio_button_checked
+                                            : Icons.radio_button_off,
+                                        size: 18,
+                                        color: isSelected
+                                            ? AppColors.accentBlue
+                                            : AppColors.textMuted(context),
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            Row(
+                                              children: [
+                                                Flexible(
+                                                  child: Text(
+                                                    leader.name,
+                                                    overflow: TextOverflow.ellipsis,
+                                                    style: TextStyle(
+                                                        color: AppColors.textMain(
+                                                            context),
+                                                        fontSize: 13,
+                                                        fontWeight: FontWeight.w600),
+                                                  ),
+                                                ),
+                                                if (isTopOfList &&
+                                                    leader.distanceKm != null) ...[
+                                                  const SizedBox(width: 6),
+                                                  Container(
+                                                    padding:
+                                                        const EdgeInsets.symmetric(
+                                                            horizontal: 6,
+                                                            vertical: 2),
+                                                    decoration: BoxDecoration(
+                                                      color: AppColors.accentGreen
+                                                          .withOpacity(0.15),
+                                                      borderRadius:
+                                                          BorderRadius.circular(4),
+                                                    ),
+                                                    child: Text('NEAREST',
+                                                        style: TextStyle(
+                                                            color: AppColors
+                                                                .accentGreen,
+                                                            fontSize: 9,
+                                                            fontWeight:
+                                                                FontWeight.w800,
+                                                            letterSpacing: 0.3)),
+                                                  ),
+                                                ],
+                                              ],
+                                            ),
+                                            const SizedBox(height: 2),
+                                            Text(
+                                              [
+                                                if (leader.purok != null &&
+                                                    leader.purok!.isNotEmpty)
+                                                  leader.purok!,
+                                                _distanceLabel(leader),
+                                              ].join(' • '),
+                                              style: TextStyle(
+                                                  color: AppColors.textMuted(context),
+                                                  fontSize: 11),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+      footer: _sheetFooter(
+        context,
+        onCancel: () => widget.onClose(),
+        confirmLabel: 'SEND REQUEST',
+        confirmColor: AppColors.accentBlue,
+        onConfirm: selectedId == null
+            ? null
+            : () => widget.onClose(
+                widget.leaders.firstWhere((l) => l.id == selectedId)),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TASK FORCE DISPATCH PICKER
+// ---------------------------------------------------------------------------
+
+class _TaskForceDispatchSelection {
+  final List<_TaskForceMember> members;
+  final String leadId;
+
+  _TaskForceDispatchSelection({required this.members, required this.leadId});
+}
+
+/// Multi-select dispatch sheet. The nearest `defaultTeamSize` AVAILABLE
+/// members are pre-checked (size comes from Admin > Auto Response) and the
+/// nearest is pre-assigned lead; "SET AS LEAD" reassigns; unchecking the lead
+/// falls back to the next selected member. Members with `isDispatched` are
+/// dimmed with an "ON DUTY" badge, can't be selected, and are never lead.
+class _TaskForceDispatchSheet extends StatefulWidget {
+  final List<_TaskForceMember> members;
+  final CctvCamera? camera;
+  final int defaultTeamSize;
+  final void Function([_TaskForceDispatchSelection? result]) onClose;
+
+  const _TaskForceDispatchSheet({
+    required this.members,
+    required this.camera,
+    required this.onClose,
+    this.defaultTeamSize = 1,
+  });
+
+  @override
+  State<_TaskForceDispatchSheet> createState() => _TaskForceDispatchSheetState();
+}
+
+class _TaskForceDispatchSheetState extends State<_TaskForceDispatchSheet> {
+  late final Set<String> _selectedIds = _initialSelection();
+  late String? _leadId = _selectedIds.isEmpty ? null : _selectedIds.first;
+  final TextEditingController _searchController = TextEditingController();
+  String _query = '';
+
+  Set<String> _initialSelection() => widget.members
+      .where((m) => !m.isDispatched)
+      .take(widget.defaultTeamSize)
+      .map((m) => m.id)
+      .toSet();
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  List<_TaskForceMember> get _filtered {
+    if (_query.isEmpty) return widget.members;
+    final q = _query.toLowerCase();
+    return widget.members.where((m) => m.name.toLowerCase().contains(q)).toList();
+  }
+
+  String _distanceLabel(_TaskForceMember m) {
+    if (m.distanceKm == null) return 'Location not set';
+    if (m.distanceKm! < 1) return '${(m.distanceKm! * 1000).round()} m away';
+    return '${m.distanceKm!.toStringAsFixed(1)} km away';
+  }
+
+  void _toggle(_TaskForceMember member) {
+    if (member.isDispatched) return;
+    setState(() {
+      if (_selectedIds.contains(member.id)) {
+        _selectedIds.remove(member.id);
+        if (_leadId == member.id) {
+          final remaining =
+              widget.members.where((m) => _selectedIds.contains(m.id)).toList();
+          _leadId = remaining.isEmpty ? null : remaining.first.id;
+        }
+      } else {
+        _selectedIds.add(member.id);
+        _leadId ??= member.id;
+      }
+    });
+  }
+
+  Widget _badge(String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(text,
+          style: TextStyle(
+              color: color,
+              fontSize: 9,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.3)),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final filtered = _filtered;
+
+    return _SidePanelShell(
+      header: _sheetHeader(
+        context,
+        'Dispatch Task Force',
+        () => widget.onClose(),
+        icon: Icons.groups_outlined,
+        iconColor: AppColors.accentRed,
+        subtitle: '${widget.members.length} members available',
+      ),
+      content: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              flex: 5,
+              child: _DispatchMapPane(
+                cameraName: _cameraLabel(widget.camera),
+                cameraLat: widget.camera?.latitude,
+                cameraLng: widget.camera?.longitude,
+                selectedPoints: widget.members
+                    .where((m) => _selectedIds.contains(m.id) && m.hasLocation)
+                    .map((m) => _MapPoint(
+                          name: m.name,
+                          lat: m.latitude!,
+                          lng: m.longitude!,
+                          isLead: m.id == _leadId,
+                        ))
+                    .toList(),
+                accentColor: AppColors.accentRed,
+              ),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              flex: 4,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _pickerSearchField(
+                    context,
+                    controller: _searchController,
+                    hint: 'Search task force members…',
+                    query: _query,
+                    onChanged: (val) => setState(() => _query = val),
+                    onClear: () => setState(() {
+                      _searchController.clear();
+                      _query = '';
+                    }),
+                  ),
+                  const SizedBox(height: 10),
+                  Expanded(
+                    child: filtered.isEmpty
+                        ? Center(
+                            child: Text('No members match your search.',
+                                style: TextStyle(
+                                    color: AppColors.textMuted(context),
+                                    fontSize: 13)),
+                          )
+                        : ListView.separated(
+                            itemCount: filtered.length,
+                            separatorBuilder: (_, __) => const SizedBox(height: 8),
+                            itemBuilder: (context, index) {
+                              final member = filtered[index];
+                              final isChecked = _selectedIds.contains(member.id);
+                              final isLead = _leadId == member.id;
+                              final isDispatched = member.isDispatched;
+
+                              return Opacity(
+                                opacity: isDispatched ? 0.55 : 1.0,
+                                child: InkWell(
+                                  borderRadius: BorderRadius.circular(10),
+                                  onTap: isDispatched ? null : () => _toggle(member),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 12, vertical: 10),
+                                    decoration: BoxDecoration(
+                                      color: isChecked
+                                          ? AppColors.accentRed.withOpacity(0.10)
+                                          : AppColors.bg(context),
+                                      borderRadius: BorderRadius.circular(10),
+                                      border: Border.all(
+                                        color: isChecked
+                                            ? AppColors.accentRed
+                                            : AppColors.border(context),
+                                      ),
+                                    ),
+                                    child: Row(
+                                      children: [
+                                        Icon(
+                                          isDispatched
+                                              ? Icons.lock_clock
+                                              : (isChecked
+                                                  ? Icons.check_box
+                                                  : Icons.check_box_outline_blank),
+                                          size: 18,
+                                          color: isDispatched
+                                              ? AppColors.textMuted(context)
+                                              : (isChecked
+                                                  ? AppColors.accentRed
+                                                  : AppColors.textMuted(context)),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Row(
+                                                children: [
+                                                  Flexible(
+                                                    child: Text(
+                                                      member.name,
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
+                                                      style: TextStyle(
+                                                          color: AppColors.textMain(
+                                                              context),
+                                                          fontSize: 13,
+                                                          fontWeight:
+                                                              FontWeight.w600),
+                                                    ),
+                                                  ),
+                                                  if (isLead) ...[
+                                                    const SizedBox(width: 6),
+                                                    _badge('LEAD',
+                                                        AppColors.accentRed),
+                                                  ],
+                                                  if (isDispatched) ...[
+                                                    const SizedBox(width: 6),
+                                                    _badge('ON DUTY', _kAmber),
+                                                  ],
+                                                ],
+                                              ),
+                                              const SizedBox(height: 2),
+                                              Text(
+                                                isDispatched
+                                                    ? 'Currently on an active dispatch'
+                                                    : _distanceLabel(member),
+                                                style: TextStyle(
+                                                    color: AppColors.textMuted(
+                                                        context),
+                                                    fontSize: 11),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                        if (isChecked && !isLead && !isDispatched)
+                                          TextButton(
+                                            onPressed: () =>
+                                                setState(() => _leadId = member.id),
+                                            style: TextButton.styleFrom(
+                                              foregroundColor: AppColors.accentRed,
+                                              padding: const EdgeInsets.symmetric(
+                                                  horizontal: 8),
+                                              minimumSize: const Size(0, 28),
+                                            ),
+                                            child: const Text('SET AS LEAD',
+                                                style: TextStyle(
+                                                    fontSize: 9.5,
+                                                    fontWeight: FontWeight.w800,
+                                                    letterSpacing: 0.3)),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+      footer: _sheetFooter(
+        context,
+        onCancel: () => widget.onClose(),
+        confirmLabel: 'DISPATCH',
+        confirmColor: AppColors.accentRed,
+        onConfirm: _selectedIds.isEmpty || _leadId == null
+            ? null
+            : () {
+                final members =
+                    widget.members.where((m) => _selectedIds.contains(m.id)).toList();
+                widget.onClose(
+                  _TaskForceDispatchSelection(members: members, leadId: _leadId!),
+                );
+              },
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// INCIDENT DETAIL DIALOG
+// ---------------------------------------------------------------------------
+
+/// Full-detail panel rendered inside the centered dialog overlay. The right
+/// column is a plain Column (not scrollable) so the dialog's IntrinsicHeight
+/// pass can measure it.
+class _IncidentDetailSheet extends StatelessWidget {
+  final _Incident incident;
+  final String cameraName;
+  final List<_LinkedReport> reports;
+  final void Function(String reportId) onOpenReport;
+  final VoidCallback onClose;
+  final VoidCallback onFalseDetection;
+  final VoidCallback onSendRequest;
+  final VoidCallback onDispatchTaskForce;
+
+  const _IncidentDetailSheet({
+    required this.incident,
+    required this.cameraName,
+    required this.reports,
+    required this.onOpenReport,
+    required this.onClose,
+    required this.onFalseDetection,
+    required this.onSendRequest,
+    required this.onDispatchTaskForce,
+  });
+
+  bool get _isLocked => incident.status != null && incident.status!.trim().isNotEmpty;
+
+  Widget _detailRow(BuildContext context, String label, String value) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            color: AppColors.textMuted(context),
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0.5,
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            value,
+            textAlign: TextAlign.end,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: AppColors.textMain(context),
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _sectionTitle(BuildContext context, String label) {
+    return Text(
+      label,
+      style: TextStyle(
+        color: AppColors.textMain(context),
+        fontSize: 12,
+        fontWeight: FontWeight.w800,
+        letterSpacing: 0.8,
+      ),
+    );
+  }
+
+  /// One tappable row in the FIELD REPORTS section.
+  Widget _reportRow(BuildContext context, _LinkedReport r) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: () => onOpenReport(r.id),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: AppColors.sunken(context),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: AppColors.border(context)),
+          ),
+          child: Row(
+            children: [
+              Icon(Icons.description_outlined, size: 16, color: AppColors.accentBlue),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${_reportSourceLabel(r.sourceType)} report',
+                      style: TextStyle(
+                          color: AppColors.textMain(context),
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${_reportOutcomeLabel(r.outcome)} • '
+                      '${DateFormat('MMM d, h:mm a').format(r.submittedAt)}',
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                          color: AppColors.textMuted(context), fontSize: 11),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(Icons.arrow_forward,
+                  size: 15, color: AppColors.textMuted(context)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final level = incident.alertLevel;
+    final divider = Divider(color: AppColors.border(context), height: 20);
+
+    return _SidePanelShell(
+      header: _sheetHeader(
+        context,
+        'Incident Details',
+        onClose,
+        icon: Icons.videocam_outlined,
+        iconColor: level.color,
+        subtitle: cameraName,
+      ),
+      content: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // LEFT: footage + camera info
+            Expanded(
+              flex: 3,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: AppColors.border(context)),
+                    ),
+                    clipBehavior: Clip.antiAlias,
+                    child: Container(
+                      color: Colors.black,
+                      child: Stack(
+                        children: [
+                          _IncidentMedia(
+                              videoUrl: incident.videoUrl,
+                              imageUrl: incident.imageUrl),
+                          if (incident.alertType.isNotEmpty)
+                            Positioned(
+                              right: 8,
+                              top: 8,
+                              child: _LevelPill(
+                                  text: incident.alertType, color: level.color),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  _CameraInfoCard(
+                    thumbnailUrl: incident.imageUrl,
+                    cameraName: cameraName,
+                    timeLabel: DateFormat('yyyy-MM-dd HH:mm:ss')
+                        .format(incident.occurredAt),
+                    hasClip: incident.videoUrl != null,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 18),
+            VerticalDivider(width: 1, thickness: 1, color: AppColors.border(context)),
+            const SizedBox(width: 18),
+
+            // RIGHT: info + actions
+            Expanded(
+              flex: 2,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _sectionTitle(context, 'INCIDENT INFORMATION'),
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: AppColors.sunken(context),
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: AppColors.border(context)),
+                    ),
+                    child: Column(
+                      children: [
+                        _detailRow(context, 'TYPE',
+                            incident.alertType.isEmpty ? 'N/A' : incident.alertType),
+                        divider,
+                        _detailRow(context, 'DATE',
+                            DateFormat('yyyy-MM-dd').format(incident.occurredAt)),
+                        divider,
+                        _detailRow(context, 'TIME',
+                            DateFormat('h:mm a').format(incident.occurredAt)),
+                        divider,
+                        _detailRow(context, 'LOCATION', cameraName),
+                        if (incident.confidence != null) ...[
+                          divider,
+                          _detailRow(context, 'CONFIDENCE',
+                              '${(incident.confidence! * 100).round()}%'),
+                        ],
+                        if (incident.detectedObjects != null &&
+                            incident.detectedObjects!.isNotEmpty) ...[
+                          divider,
+                          _detailRow(context, 'DETECTED OBJECTS',
+                              incident.detectedObjects!.join(', ')),
+                        ],
+                        divider,
+                        _detailRow(context, 'ALERT LEVEL', _levelName(level)),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  if (_isLocked) ...[
+                    _sectionTitle(context, 'STATUS'),
+                    const SizedBox(height: 10),
+                    Builder(builder: (context) {
+                      final info = _statusInfoFor(context, incident.status);
+                      return Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 14, vertical: 12),
+                        decoration: BoxDecoration(
+                          color: info.color.withOpacity(0.10),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: info.color.withOpacity(0.35)),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(info.icon, color: info.color, size: 18),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                info.label,
+                                style: TextStyle(
+                                    color: info.color,
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.w700),
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    }),
+                  ] else ...[
+                    _sectionTitle(context, 'RESPONSE ACTIONS'),
+                    const SizedBox(height: 10),
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _DetailActionButton(
+                          icon: Icons.person_pin_circle_outlined,
+                          label: 'Send to Purok Leader',
+                          color: AppColors.accentBlue,
+                          onTap: onSendRequest,
+                        ),
+                        const SizedBox(height: 10),
+                        _DetailActionButton(
+                          icon: Icons.groups_outlined,
+                          label: 'Dispatch Task Force',
+                          color: AppColors.accentRed,
+                          onTap: onDispatchTaskForce,
+                        ),
+                        const SizedBox(height: 10),
+                        _DetailActionButton(
+                          icon: Icons.block,
+                          label: 'Mark as False Detection',
+                          color: AppColors.card(context),
+                          textColor: AppColors.textMain(context),
+                          iconColor: AppColors.textMuted(context),
+                          bordered: true,
+                          onTap: onFalseDetection,
+                        ),
+                      ],
+                    ),
+                  ],
+
+                  // FIELD REPORTS: reports filed for this incident. Only shown
+                  // when there is something to show or the incident has been
+                  // handled (so "No report filed yet." is meaningful).
+                  if (reports.isNotEmpty || _isLocked) ...[
+                    const SizedBox(height: 20),
+                    _sectionTitle(context, 'FIELD REPORTS'),
+                    const SizedBox(height: 10),
+                    if (reports.isEmpty)
+                      Text('No report filed yet.',
+                          style: TextStyle(
+                              color: AppColors.textMuted(context), fontSize: 12))
+                    else ...[
+                      // The dialog can't scroll (IntrinsicHeight), so cap it.
+                      for (final r in reports.take(3)) _reportRow(context, r),
+                      if (reports.length > 3)
+                        Text(
+                          '+${reports.length - 3} more — open the report screen to see all',
+                          style: TextStyle(
+                              color: AppColors.textMuted(context), fontSize: 11),
+                        ),
+                    ],
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CameraInfoCard extends StatelessWidget {
+  final String thumbnailUrl;
+  final String cameraName;
+  final String timeLabel;
+  final bool hasClip;
+
+  const _CameraInfoCard({
+    required this.thumbnailUrl,
+    required this.cameraName,
+    required this.timeLabel,
+    required this.hasClip,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: AppColors.sunken(context),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.border(context)),
+      ),
+      child: Row(
+        children: [
+          Stack(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Image.network(
+                  thumbnailUrl,
+                  width: 52,
+                  height: 52,
+                  fit: BoxFit.cover,
+                  errorBuilder: (context, error, stack) => Container(
+                    width: 52,
+                    height: 52,
+                    color: AppColors.bg(context),
+                    child: const Icon(Icons.broken_image,
+                        color: Colors.white24, size: 18),
+                  ),
+                ),
+              ),
+              if (hasClip)
+                Positioned(
+                  right: 2,
+                  bottom: 2,
+                  child: Container(
+                    padding: const EdgeInsets.all(2),
+                    decoration: const BoxDecoration(
+                        color: Colors.black54, shape: BoxShape.circle),
+                    child: const Icon(Icons.videocam, color: Colors.white, size: 10),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  cameraName,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      color: AppColors.textMain(context),
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 3),
+                Row(
+                  children: [
+                    Icon(Icons.access_time,
+                        size: 11, color: AppColors.textMuted(context)),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: Text(
+                        timeLabel,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            color: AppColors.textMuted(context), fontSize: 10.5),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DetailActionButton extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+  final VoidCallback onTap;
+  final bool bordered;
+  final Color? textColor;
+  final Color? iconColor;
+
+  const _DetailActionButton({
+    required this.icon,
+    required this.label,
+    required this.color,
+    required this.onTap,
+    this.bordered = false,
+    this.textColor,
+    this.iconColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final fg = textColor ?? Colors.white;
+    final ic = iconColor ?? fg;
+
+    return Material(
+      color: color,
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: bordered ? Border.all(color: AppColors.border(context)) : null,
+            boxShadow: bordered
+                ? null
+                : [
+                    BoxShadow(
+                      color: color.withOpacity(0.35),
+                      blurRadius: 10,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+          ),
+          child: Row(
+            children: [
+              Icon(icon, size: 17, color: ic),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  label,
+                  style: TextStyle(
+                      color: fg, fontSize: 12.5, fontWeight: FontWeight.w700),
+                ),
+              ),
+              Icon(Icons.arrow_forward,
+                  size: 16, color: fg.withOpacity(bordered ? 0.6 : 0.85)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Media pane: plays the before+after clip (media_kit — video_player has no
+/// Windows/Linux support) with its own control bar, else shows the still
+/// thumbnail. The box takes the clip's real aspect ratio (from
+/// `player.state.width/height`) so there's no cropping and no letterbox bars;
+/// the control bar sits BELOW the AspectRatio box.
+class _IncidentMedia extends StatefulWidget {
+  final String? videoUrl;
+  final String imageUrl;
+
+  const _IncidentMedia({required this.videoUrl, required this.imageUrl});
+
+  @override
+  State<_IncidentMedia> createState() => _IncidentMediaState();
+}
+
+class _IncidentMediaState extends State<_IncidentMedia> {
+  Player? _player;
+  VideoController? _videoController;
+  bool _ready = false;
+  bool _failed = false;
+  bool _muted = false;
+  double? _aspectRatio;
+
+  @override
+  void initState() {
+    super.initState();
+    final url = widget.videoUrl;
+    if (url != null) {
+      final player = Player();
+      _player = player;
+      _videoController = VideoController(player);
+
+      player.stream.error.listen((_) {
+        if (!mounted) return;
+        setState(() => _failed = true);
+      });
+
+      player.stream.width.listen((_) => _updateAspectRatio());
+      player.stream.height.listen((_) => _updateAspectRatio());
+
+      player.open(Media(url)).then((_) async {
+        if (!mounted) return;
+        setState(() => _ready = true);
+        _updateAspectRatio();
+        await player.setPlaylistMode(PlaylistMode.loop);
+      }).catchError((_) {
+        if (!mounted) return;
+        setState(() => _failed = true);
+      });
+    }
+  }
+
+  void _updateAspectRatio() {
+    final w = _player?.state.width;
+    final h = _player?.state.height;
+    if (w == null || h == null || w == 0 || h == 0) return;
+    final ratio = w / h;
+    if (_aspectRatio != ratio) {
+      if (!mounted) return;
+      setState(() => _aspectRatio = ratio);
+    }
+  }
+
+  @override
+  void dispose() {
+    _player?.dispose();
+    super.dispose();
+  }
+
+  String _fmt(Duration d) {
+    if (d.isNegative) return '00:00';
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$m:$s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final player = _player;
+    final videoController = _videoController;
+    if (player != null && videoController != null && _ready && !_failed) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          AspectRatio(
+            aspectRatio: _aspectRatio ?? 16 / 9,
+            child: GestureDetector(
+              onTap: () => player.playOrPause(),
+              child: Stack(
+                fit: StackFit.expand,
+                alignment: Alignment.center,
+                children: [
+                  Video(
+                    controller: videoController,
+                    controls: NoVideoControls,
+                    fit: BoxFit.cover,
+                  ),
+                  StreamBuilder<bool>(
+                    stream: player.stream.playing,
+                    builder: (context, snapshot) {
+                      final playing = snapshot.data ?? true;
+                      if (playing) return const SizedBox.shrink();
+                      return const Icon(Icons.play_arrow,
+                          color: Colors.white70, size: 48);
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            color: Colors.black.withOpacity(0.4),
+            child: StreamBuilder<Duration>(
+              stream: player.stream.position,
+              builder: (context, snapshot) {
+                final position = snapshot.data ?? Duration.zero;
+                final total = player.state.duration;
+                final sliderMax =
+                    total.inMilliseconds > 0 ? total.inMilliseconds.toDouble() : 1.0;
+                final sliderValue =
+                    position.inMilliseconds.toDouble().clamp(0.0, sliderMax);
+                return Row(
+                  children: [
+                    StreamBuilder<bool>(
+                      stream: player.stream.playing,
+                      builder: (context, playSnap) {
+                        final playing = playSnap.data ?? true;
+                        return IconButton(
+                          padding: EdgeInsets.zero,
+                          constraints:
+                              const BoxConstraints(minWidth: 28, minHeight: 28),
+                          iconSize: 18,
+                          color: Colors.white,
+                          onPressed: () => player.playOrPause(),
+                          icon: Icon(playing ? Icons.pause : Icons.play_arrow),
+                        );
+                      },
+                    ),
+                    Text(
+                      '${_fmt(position)} / ${_fmt(total)}',
+                      style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 10.5,
+                          fontFamily: 'monospace'),
+                    ),
+                    Expanded(
+                      child: SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 2.5,
+                          thumbShape:
+                              const RoundSliderThumbShape(enabledThumbRadius: 5),
+                          overlayShape:
+                              const RoundSliderOverlayShape(overlayRadius: 10),
+                          activeTrackColor: AppColors.accentBlue,
+                          inactiveTrackColor: Colors.white24,
+                          thumbColor: AppColors.accentBlue,
+                        ),
+                        child: Slider(
+                          min: 0,
+                          max: sliderMax,
+                          value: sliderValue,
+                          onChanged: (v) =>
+                              player.seek(Duration(milliseconds: v.round())),
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                      iconSize: 16,
+                      color: Colors.white,
+                      onPressed: () {
+                        setState(() => _muted = !_muted);
+                        player.setVolume(_muted ? 0 : 100);
+                      },
+                      icon: Icon(_muted ? Icons.volume_off : Icons.volume_up),
+                    ),
+                    // Decorative for now — wire to a real fullscreen route if needed.
+                    IconButton(
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                      iconSize: 16,
+                      color: Colors.white,
+                      onPressed: () {},
+                      icon: const Icon(Icons.fullscreen),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
+        ],
+      );
+    }
+
+    // Loading, failed, or no clip: still thumbnail at a default 16:9.
+    return AspectRatio(
+      aspectRatio: 16 / 9,
+      child: Image.network(
+        widget.imageUrl,
+        fit: BoxFit.cover,
+        loadingBuilder: (context, child, progress) => progress == null
+            ? child
+            : const Center(
+                child: SizedBox(
+                  width: 26,
+                  height: 26,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+        errorBuilder: (context, error, stack) => const Center(
+          child: Icon(Icons.broken_image, color: Colors.white24, size: 32),
+        ),
+      ),
+    );
+  }
+}
